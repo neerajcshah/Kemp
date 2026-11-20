@@ -1,0 +1,68 @@
+# Google Cloud Build -> Cloud Run Always-Free Tier deployment (us-central1)
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        gcloud artifacts repositories describe kemp-repo --location=${_REGION} >/dev/null 2>&1 || \
+          gcloud artifacts repositories create kemp-repo \
+            --repository-format=docker \
+            --location=${_REGION} \
+            --description="Kemp Online free-tier container repo"
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/kemp-repo/kemp:latest'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/kemp-repo/kemp:latest'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'kemp'
+      - '--image'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/kemp-repo/kemp:latest'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '1'
+      - '--cpu'
+      - '1'
+      - '--memory'
+      - '256Mi'
+      - '--cpu-throttling'
+      - '--session-affinity'
+      - '--timeout'
+      - '3600'
+
+  # Apply Artifact Registry cleanup policy so old image layers never exceed the 0.5 GB free tier
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'artifacts'
+      - 'repositories'
+      - 'set-cleanup-policies'
+      - 'kemp-repo'
+      - '--location=${_REGION}'
+      - '--policy=artifact-cleanup-policy.json'
+      - '--no-dry-run'
+
+substitutions:
+  _REGION: us-central1
+
+options:
+  logging: CLOUD_LOGGING_ONLY

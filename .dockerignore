@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+test
+README.md
+.firebase
+firebase.json
+database.rules.json
+cloudbuild.yaml
+artifact-cleanup-policy.json
+deploy-free-cloud-run.sh
+app.json
