@@ -1156,3 +1156,204 @@ function projectRoomForViewer(rm, viewerId) {
     matchWinnerTeam: rm.matchWinnerTeam ?? null,
   };
 }
+
+/**
+ * In-browser static fallback transport (used on GitHub Pages until FIREBASE_CONFIG is pasted).
+ * Supports full solo/bot play AND multi-tab same-browser sync via BroadcastChannel + localStorage.
+ */
+export function createLocalPracticeTransport(onEvent) {
+  let tabId = sessionStorage.getItem('kemp_local_tab_id');
+  if (!tabId) {
+    tabId = `local_${Math.random().toString(36).slice(2, 10)}`;
+    sessionStorage.setItem('kemp_local_tab_id', tabId);
+  }
+
+  let activeCode = null;
+  let lastTs = 0;
+  const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('kemp_local_rooms') : null;
+
+  function loadRoom(code) {
+    try {
+      const raw = localStorage.getItem(`kemp_room_${code}`);
+      return raw ? normalizeRoom(JSON.parse(raw)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveAndBroadcast(rm) {
+    rm.updatedAt = Date.now();
+    try {
+      localStorage.setItem(`kemp_room_${rm.code}`, JSON.stringify(rm));
+    } catch {}
+    emitProjected(rm);
+    channel?.postMessage({ code: rm.code });
+  }
+
+  function emitProjected(rm) {
+    let evt = null;
+    if (rm.lastAction && rm.lastAction.timestamp > lastTs) {
+      lastTs = rm.lastAction.timestamp;
+      evt = rm.lastAction.event || null;
+    }
+    onEvent({ type: 'room_state', state: projectRoomForViewer(rm, tabId), event: evt });
+  }
+
+  if (channel) {
+    channel.onmessage = (ev) => {
+      if (activeCode && ev.data?.code === activeCode) {
+        const rm = loadRoom(activeCode);
+        if (rm) emitProjected(rm);
+      }
+    };
+  }
+
+  setTimeout(() => {
+    onEvent({
+      type: 'welcome',
+      tells: Object.values(TABLE_TELLS),
+      signalSuggestions: SIGNAL_SUGGESTIONS,
+    });
+  }, 0);
+
+  const tick = setInterval(() => {
+    if (!activeCode) return;
+    const rm = loadRoom(activeCode);
+    if (!rm || rm.hostId !== tabId) return;
+
+    const now = Date.now();
+    if (rm.phase === 'huddle' && rm.huddleEndsAt > 0 && now >= rm.huddleEndsAt) {
+      dealCardsOnRoom(rm, 2200);
+      saveAndBroadcast(rm);
+    } else if (rm.phase === 'countdown' && now >= rm.countdownEndsAt) {
+      rm.phase = 'playing';
+      rm.countdownEndsAt = 0;
+      rm.lastFlushAt = now;
+      rm.lastAction = { timestamp: now, event: { kind: 'round_live' } };
+      saveAndBroadcast(rm);
+    } else if (rm.phase === 'accusing' && rm.accusation && now >= rm.accusation.expiresAt) {
+      const opps = getActivePlayers(rm).filter((p) => p.teamIndex !== rm.accusation.callerTeam);
+      if (opps.length > 0) {
+        executeNotKemp(rm, rm.accusation.callerId, opps[randInt(opps.length)].id);
+        saveAndBroadcast(rm);
+      }
+    } else if (rm.phase === 'playing') {
+      if (getActivePlayers(rm).some((p) => p.isBot) && Math.random() < 0.5) {
+        const before = JSON.stringify(rm);
+        runBotsStep(rm);
+        if (JSON.stringify(rm) !== before) saveAndBroadcast(rm);
+      }
+    }
+  }, 450);
+
+  return {
+    destroy() {
+      clearInterval(tick);
+      channel?.close();
+    },
+
+    send(msg) {
+      const { type } = msg || {};
+
+      if (type === 'create_room') {
+        const code = genCode();
+        const host = makePlayer(tabId, msg.name, false);
+        const rm = makeFreshRoom(code, host);
+        if (msg.quickDemo) {
+          fillBotsOnRoom(rm);
+          startMatchOnRoom(rm, tabId);
+        } else {
+          onEvent({
+            type: 'toast',
+            kind: 'info',
+            message: 'Practice / Same-Browser Mode — add Firebase config to sync across separate phones/laptops!',
+          });
+        }
+        activeCode = code;
+        onEvent({ type: 'joined', roomCode: code, playerId: tabId, token: tabId });
+        saveAndBroadcast(rm);
+        return;
+      }
+
+      if (type === 'join_room') {
+        const code = String(msg.code || '').trim().toUpperCase();
+        const rm = loadRoom(code);
+        if (!rm) {
+          onEvent({
+            type: 'error',
+            code: 'ROOM_NOT_FOUND',
+            message: `Room "${code}" not found on this browser (paste firebaseConfig to link separate devices!).`,
+          });
+          return;
+        }
+        let p = rm.players[tabId];
+        if (p) {
+          p.connected = true;
+          if (msg.name) p.name = cleanName(msg.name);
+        } else {
+          p = makePlayer(tabId, msg.name, false);
+          rm.players[tabId] = p;
+          if (rm.phase === 'lobby') autoSeat(rm, tabId);
+        }
+        activeCode = code;
+        onEvent({ type: 'joined', roomCode: code, playerId: tabId, token: tabId });
+        saveAndBroadcast(rm);
+        return;
+      }
+
+      if (type === 'leave_room') {
+        activeCode = null;
+        onEvent({ type: 'left_room' });
+        return;
+      }
+
+      if (!activeCode) return;
+      const rm = loadRoom(activeCode);
+      if (!rm) return;
+
+      let res = { ok: true };
+      switch (type) {
+        case 'select_seat': res = seatOnRoom(rm, tabId, Number(msg.teamIndex), Number(msg.seatIndex)); break;
+        case 'add_bot': res = addBotOnRoom(rm, Number(msg.teamIndex), Number(msg.seatIndex)); break;
+        case 'fill_bots': res = fillBotsOnRoom(rm); break;
+        case 'remove_player': {
+          const tgt = rm.players[msg.targetId];
+          if (tgt && tgt.id !== tabId) {
+            if (tgt.teamIndex !== null && rm.teams[tgt.teamIndex]?.seats[tgt.seatIndex] === tgt.id) {
+              rm.teams[tgt.teamIndex].seats[tgt.seatIndex] = '';
+            }
+            delete rm.players[tgt.id];
+          }
+          break;
+        }
+        case 'update_settings': res = updateSettingsOnRoom(rm, tabId, msg.settings || {}); break;
+        case 'start_match': res = startMatchOnRoom(rm, tabId); break;
+        case 'huddle_message': res = addHuddleMsg(rm, tabId, msg.text); break;
+        case 'huddle_signal': res = setSignalOnRoom(rm, tabId, msg.signalNote); break;
+        case 'huddle_ready': res = toggleReadyOnRoom(rm, tabId); break;
+        case 'swap_card': res = swapCardOnRoom(rm, tabId, msg.handCardId, Number(msg.centerIndex), msg.expectedCenterCardId); break;
+        case 'toggle_flush': res = toggleFlushOnRoom(rm, tabId); break;
+        case 'table_tell': res = sendTellOnRoom(rm, tabId, msg.tellKey); break;
+        case 'call_kemp': res = executeKemp(rm, tabId); break;
+        case 'call_not_kemp': res = executeNotKemp(rm, tabId, msg.targetPlayerId || null); break;
+        case 'next_round': enterHuddleOnRoom(rm); break;
+        case 'return_lobby':
+          rm.phase = 'lobby';
+          rm.roundNumber = 0;
+          rm.centerCards = [];
+          rm.roundSummary = null;
+          rm.matchWinnerTeam = null;
+          rm.teams.forEach((t) => { t.letters = 0; t.eliminated = false; });
+          Object.values(rm.players).forEach((p) => { p.hand = []; p.huddleReady = false; });
+          break;
+      }
+
+      if (res && res.ok === false) {
+        if (res.code === 'RACE_LOST') onEvent({ type: 'swap_rejected', code: res.code, message: res.message });
+        else if (res.message) onEvent({ type: 'toast', kind: 'warn', message: res.message });
+        return;
+      }
+      saveAndBroadcast(rm);
+    },
+  };
+}

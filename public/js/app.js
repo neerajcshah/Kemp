@@ -234,8 +234,10 @@ async function initBackendTransport() {
     console.error('Firebase initialization failed:', err);
   }
 
-  // Fallback: attempt standard WebSocket connection
-  connectWebSocket();
+  // 3. Static host (e.g., GitHub Pages before FIREBASE_CONFIG is pasted): run in-browser practice & multi-tab engine
+  const { createLocalPracticeTransport } = await import('./firebaseAdapter.js');
+  fbTransport = createLocalPracticeTransport(handleServerMessage);
+  autoRejoinIfStored();
 }
 
 function handleRoomAudioEvent(event, prevPhase, nextPhase) {
