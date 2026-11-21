@@ -1,0 +1,43 @@
+name: Deploy to Firebase (Spark Free Plan)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if Firebase secrets are configured
+        id: check_secrets
+        run: |
+          if [[ -n "${FIREBASE_SERVICE_ACCOUNT}" && -n "${FIREBASE_PROJECT_ID}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping Firebase deploy until FIREBASE_PROJECT_ID and FIREBASE_SERVICE_ACCOUNT secrets are added."
+          fi
+
+      - name: Deploy Realtime Database Security Rules
+        if: steps.check_secrets.outputs.configured == 'true'
+        run: |
+          KEY_FILE="$(mktemp)"
+          printf '%s' "${FIREBASE_SERVICE_ACCOUNT}" > "${KEY_FILE}"
+          export GOOGLE_APPLICATION_CREDENTIALS="${KEY_FILE}"
+          npx -y firebase-tools@latest deploy --only database --project "${FIREBASE_PROJECT_ID}"
+          rm -f "${KEY_FILE}"
+
+      - name: Deploy Static Web App to Firebase Hosting
+        if: steps.check_secrets.outputs.configured == 'true'
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
+          channelId: live
