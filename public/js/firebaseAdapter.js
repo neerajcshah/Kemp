@@ -1158,55 +1158,40 @@ function projectRoomForViewer(rm, viewerId) {
 }
 
 /**
- * In-browser static fallback transport (used on GitHub Pages until FIREBASE_CONFIG is pasted).
- * Supports full solo/bot play AND multi-tab same-browser sync via BroadcastChannel + localStorage.
+ * Zero-setup WebRTC Peer-to-Peer Multiplayer Transport (PeerJS + Google STUN servers).
+ * Lets real humans across separate phones and laptops join a 4-letter Room Code directly on
+ * GitHub Pages for $0 with zero accounts or database setup — plus full AI Bot support!
  */
 export function createLocalPracticeTransport(onEvent) {
-  let tabId = sessionStorage.getItem('kemp_local_tab_id');
-  if (!tabId) {
-    tabId = `local_${Math.random().toString(36).slice(2, 10)}`;
-    sessionStorage.setItem('kemp_local_tab_id', tabId);
+  const PEER_OPTIONS = {
+    config: {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+      ],
+    },
+  };
+
+  let myId = sessionStorage.getItem('kemp_p2p_player_id');
+  if (!myId) {
+    myId = `p_${Math.random().toString(36).slice(2, 11)}`;
+    sessionStorage.setItem('kemp_p2p_player_id', myId);
   }
 
-  let activeCode = null;
-  let lastTs = 0;
-  const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('kemp_local_rooms') : null;
+  const roomPeerId = (code) => `kemp-online-v1-${String(code).toUpperCase()}`;
 
-  function loadRoom(code) {
-    try {
-      const raw = localStorage.getItem(`kemp_room_${code}`);
-      return raw ? normalizeRoom(JSON.parse(raw)) : null;
-    } catch {
-      return null;
-    }
-  }
+  let role = null; // 'host' | 'guest' | null
+  let hostPeer = null;
+  let hostRoom = null;
+  let lastHostActionTs = 0;
+  const guestConns = new Map(); // playerId -> DataConnection
 
-  function saveAndBroadcast(rm) {
-    rm.updatedAt = Date.now();
-    try {
-      localStorage.setItem(`kemp_room_${rm.code}`, JSON.stringify(rm));
-    } catch {}
-    emitProjected(rm);
-    channel?.postMessage({ code: rm.code });
-  }
-
-  function emitProjected(rm) {
-    let evt = null;
-    if (rm.lastAction && rm.lastAction.timestamp > lastTs) {
-      lastTs = rm.lastAction.timestamp;
-      evt = rm.lastAction.event || null;
-    }
-    onEvent({ type: 'room_state', state: projectRoomForViewer(rm, tabId), event: evt });
-  }
-
-  if (channel) {
-    channel.onmessage = (ev) => {
-      if (activeCode && ev.data?.code === activeCode) {
-        const rm = loadRoom(activeCode);
-        if (rm) emitProjected(rm);
-      }
-    };
-  }
+  let guestPeer = null;
+  let guestConn = null;
+  let targetGuestCode = null;
+  let targetGuestName = '';
+  let guestReconnectTimer = null;
 
   setTimeout(() => {
     onEvent({
@@ -1216,144 +1201,472 @@ export function createLocalPracticeTransport(onEvent) {
     });
   }, 0);
 
-  const tick = setInterval(() => {
-    if (!activeCode) return;
-    const rm = loadRoom(activeCode);
-    if (!rm || rm.hostId !== tabId) return;
+  function cleanupPeers() {
+    role = null;
+    targetGuestCode = null;
+    if (guestReconnectTimer) {
+      clearTimeout(guestReconnectTimer);
+      guestReconnectTimer = null;
+    }
+    for (const c of guestConns.values()) {
+      try { c.close(); } catch {}
+    }
+    guestConns.clear();
+    if (guestConn) {
+      try { guestConn.close(); } catch {}
+      guestConn = null;
+    }
+    if (hostPeer) {
+      try { hostPeer.destroy(); } catch {}
+      hostPeer = null;
+    }
+    if (guestPeer) {
+      try { guestPeer.destroy(); } catch {}
+      guestPeer = null;
+    }
+    hostRoom = null;
+  }
 
+  function persistHostRoom() {
+    if (!hostRoom) return;
+    try {
+      sessionStorage.setItem('kemp_p2p_hosted_code', hostRoom.code);
+      sessionStorage.setItem(`kemp_p2p_room_${hostRoom.code}`, JSON.stringify(hostRoom));
+    } catch {}
+  }
+
+  function loadPersistedHostRoom(code) {
+    try {
+      const savedCode = sessionStorage.getItem('kemp_p2p_hosted_code');
+      if (savedCode !== code) return null;
+      const raw = sessionStorage.getItem(`kemp_p2p_room_${code}`);
+      return raw ? normalizeRoom(JSON.parse(raw)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function broadcastFromHost() {
+    if (!hostRoom) return;
+    hostRoom.updatedAt = Date.now();
+    persistHostRoom();
+
+    let evt = null;
+    if (hostRoom.lastAction && hostRoom.lastAction.timestamp > lastHostActionTs) {
+      lastHostActionTs = hostRoom.lastAction.timestamp;
+      evt = hostRoom.lastAction.event || null;
+    }
+
+    // 1. Project & emit for Host player
+    onEvent({
+      type: 'room_state',
+      state: projectRoomForViewer(hostRoom, myId),
+      event: evt,
+    });
+
+    // 2. Project & send privately to each connected Guest over their WebRTC DataChannel
+    for (const [pid, conn] of guestConns.entries()) {
+      if (conn && conn.open) {
+        try {
+          conn.send({
+            type: 'room_state',
+            state: projectRoomForViewer(hostRoom, pid),
+            event: evt,
+          });
+        } catch {}
+      }
+    }
+  }
+
+  function applyRoomActionAsHost(actorId, msg) {
+    if (!hostRoom) return { ok: false };
+    const rm = hostRoom;
+    const { type } = msg || {};
+
+    switch (type) {
+      case 'select_seat':
+        return seatOnRoom(rm, actorId, Number(msg.teamIndex), Number(msg.seatIndex));
+      case 'add_bot':
+        if (rm.hostId !== actorId) return { ok: false, message: 'Only the host can add bots.' };
+        return addBotOnRoom(rm, Number(msg.teamIndex), Number(msg.seatIndex));
+      case 'fill_bots':
+        if (rm.hostId !== actorId) return { ok: false, message: 'Only the host can fill bots.' };
+        return fillBotsOnRoom(rm);
+      case 'remove_player': {
+        if (rm.hostId !== actorId) return { ok: false, message: 'Only the host can remove seats.' };
+        const tgt = rm.players[msg.targetId];
+        if (tgt && tgt.id !== actorId) {
+          if (tgt.teamIndex !== null && rm.teams[tgt.teamIndex]?.seats[tgt.seatIndex] === tgt.id) {
+            rm.teams[tgt.teamIndex].seats[tgt.seatIndex] = '';
+          }
+          delete rm.players[tgt.id];
+          const existingConn = guestConns.get(tgt.id);
+          if (existingConn) {
+            try { existingConn.send({ type: 'left_room' }); existingConn.close(); } catch {}
+            guestConns.delete(tgt.id);
+          }
+        }
+        return { ok: true };
+      }
+      case 'update_settings':
+        return updateSettingsOnRoom(rm, actorId, msg.settings || {});
+      case 'start_match':
+        return startMatchOnRoom(rm, actorId);
+      case 'huddle_message':
+        return addHuddleMsg(rm, actorId, msg.text);
+      case 'huddle_signal':
+        return setSignalOnRoom(rm, actorId, msg.signalNote);
+      case 'huddle_ready':
+        return toggleReadyOnRoom(rm, actorId);
+      case 'swap_card':
+        return swapCardOnRoom(rm, actorId, msg.handCardId, Number(msg.centerIndex), msg.expectedCenterCardId);
+      case 'toggle_flush':
+        return toggleFlushOnRoom(rm, actorId);
+      case 'table_tell':
+        return sendTellOnRoom(rm, actorId, msg.tellKey);
+      case 'call_kemp':
+        return executeKemp(rm, actorId);
+      case 'call_not_kemp':
+        return executeNotKemp(rm, actorId, msg.targetPlayerId || null);
+      case 'next_round': {
+        if (rm.phase !== 'round_over') return { ok: true };
+        if (rm.players[actorId]) rm.players[actorId].nextRoundReady = true;
+        const humans = getActivePlayers(rm).filter((p) => !p.isBot && p.connected);
+        if (actorId === rm.hostId || humans.every((p) => p.nextRoundReady)) {
+          enterHuddleOnRoom(rm);
+        }
+        return { ok: true };
+      }
+      case 'return_lobby': {
+        if (actorId !== rm.hostId) return { ok: false, message: 'Only the host can return to the lobby.' };
+        rm.phase = 'lobby';
+        rm.roundNumber = 0;
+        rm.centerCards = [];
+        rm.roundSummary = null;
+        rm.matchWinnerTeam = null;
+        rm.teams.forEach((t) => {
+          t.letters = 0;
+          t.eliminated = false;
+        });
+        Object.values(rm.players).forEach((p) => {
+          p.hand = [];
+          p.huddleReady = false;
+        });
+        return { ok: true };
+      }
+      default:
+        return { ok: true };
+    }
+  }
+
+  function startHostPeerBroker(isFreshCreate) {
+    if (typeof window.Peer !== 'function' || !hostRoom) return;
+    if (hostPeer) {
+      try { hostPeer.destroy(); } catch {}
+    }
+
+    const peer = new window.Peer(roomPeerId(hostRoom.code), PEER_OPTIONS);
+    hostPeer = peer;
+
+    peer.on('error', (err) => {
+      if (err?.type === 'unavailable-id' && isFreshCreate && hostRoom) {
+        // Rare 4-letter collision: roll a fresh code seamlessly
+        const nextCode = genCode();
+        hostRoom.code = nextCode;
+        onEvent({ type: 'joined', roomCode: nextCode, playerId: myId, token: myId });
+        startHostPeerBroker(true);
+        broadcastFromHost();
+      }
+    });
+
+    peer.on('connection', (conn) => {
+      conn.on('data', (msg) => {
+        if (!hostRoom || !msg || typeof msg !== 'object') return;
+
+        if (msg.type === 'join_room') {
+          const guestId = String(msg.token || `g_${Math.random().toString(36).slice(2, 10)}`);
+          let p = hostRoom.players[guestId];
+          if (p) {
+            p.connected = true;
+            if (msg.name) p.name = cleanName(msg.name);
+          } else {
+            p = makePlayer(guestId, msg.name, false);
+            hostRoom.players[guestId] = p;
+            if (hostRoom.phase === 'lobby') {
+              autoSeat(hostRoom, guestId);
+            } else {
+              // Let arriving friend take over a bot seat if mid-game
+              const bot = Object.values(hostRoom.players).find((x) => x.isBot && x.teamIndex !== null);
+              if (bot) {
+                p.teamIndex = bot.teamIndex;
+                p.seatIndex = bot.seatIndex;
+                p.hand = bot.hand || [];
+                p.huddleReady = bot.huddleReady;
+                hostRoom.teams[bot.teamIndex].seats[bot.seatIndex] = guestId;
+                delete hostRoom.players[bot.id];
+              }
+            }
+          }
+
+          conn._playerId = guestId;
+          guestConns.set(guestId, conn);
+          try {
+            conn.send({
+              type: 'joined',
+              roomCode: hostRoom.code,
+              playerId: guestId,
+              token: guestId,
+            });
+          } catch {}
+          broadcastFromHost();
+          return;
+        }
+
+        const pid = conn._playerId;
+        if (!pid || !hostRoom.players[pid]) return;
+
+        if (msg.type === 'leave_room') {
+          const pl = hostRoom.players[pid];
+          if (hostRoom.phase === 'lobby') {
+            if (pl.teamIndex !== null && hostRoom.teams[pl.teamIndex]?.seats[pl.seatIndex] === pid) {
+              hostRoom.teams[pl.teamIndex].seats[pl.seatIndex] = '';
+            }
+            delete hostRoom.players[pid];
+          } else {
+            pl.connected = false;
+          }
+          guestConns.delete(pid);
+          try { conn.send({ type: 'left_room' }); conn.close(); } catch {}
+          broadcastFromHost();
+          return;
+        }
+
+        const res = applyRoomActionAsHost(pid, msg);
+        if (res && res.ok === false) {
+          try {
+            if (res.code === 'RACE_LOST') {
+              conn.send({ type: 'swap_rejected', code: res.code, message: res.message });
+            } else if (res.message) {
+              conn.send({ type: 'toast', kind: 'warn', message: res.message });
+            }
+          } catch {}
+          return;
+        }
+        broadcastFromHost();
+      });
+
+      conn.on('close', () => {
+        const pid = conn._playerId;
+        if (pid && hostRoom?.players[pid]) {
+          hostRoom.players[pid].connected = false;
+          guestConns.delete(pid);
+          broadcastFromHost();
+        }
+      });
+    });
+  }
+
+  function connectAsGuest(code, name, isRetry = false) {
+    if (typeof window.Peer !== 'function') {
+      onEvent({
+        type: 'error',
+        message: 'WebRTC multiplayer library failed to load — check your connection and refresh.',
+      });
+      return;
+    }
+
+    role = 'guest';
+    targetGuestCode = code;
+    targetGuestName = name;
+    if (!isRetry) {
+      onEvent({ type: 'toast', kind: 'info', message: `Connecting to Room ${code}…` });
+    }
+
+    if (guestPeer) {
+      try { guestPeer.destroy(); } catch {}
+    }
+
+    const peer = new window.Peer(PEER_OPTIONS);
+    guestPeer = peer;
+    let settled = false;
+
+    const failTimer = setTimeout(() => {
+      if (!settled && !isRetry) {
+        settled = true;
+        onEvent({
+          type: 'error',
+          code: 'ROOM_NOT_FOUND',
+          message: `Could not reach Room "${code}". Check the 4-letter code and make sure the host has the room open.`,
+        });
+      }
+    }, 8000);
+
+    peer.on('error', (err) => {
+      if (err?.type === 'peer-unavailable' && !settled) {
+        settled = true;
+        clearTimeout(failTimer);
+        if (!isRetry) {
+          onEvent({
+            type: 'error',
+            code: 'ROOM_NOT_FOUND',
+            message: `Room "${code}" was not found (or the host closed their tab).`,
+          });
+        } else {
+          scheduleGuestReconnect();
+        }
+      }
+    });
+
+    peer.on('open', () => {
+      const conn = peer.connect(roomPeerId(code), { reliable: true });
+      guestConn = conn;
+
+      conn.on('open', () => {
+        settled = true;
+        clearTimeout(failTimer);
+        conn.send({
+          type: 'join_room',
+          code,
+          name: targetGuestName,
+          token: myId,
+        });
+      });
+
+      conn.on('data', (payload) => {
+        if (payload && typeof payload === 'object') {
+          onEvent(payload);
+        }
+      });
+
+      conn.on('close', () => {
+        if (role === 'guest' && targetGuestCode === code) {
+          scheduleGuestReconnect();
+        }
+      });
+    });
+  }
+
+  function scheduleGuestReconnect() {
+    if (guestReconnectTimer || role !== 'guest' || !targetGuestCode) return;
+    guestReconnectTimer = setTimeout(() => {
+      guestReconnectTimer = null;
+      if (role === 'guest' && targetGuestCode) {
+        connectAsGuest(targetGuestCode, targetGuestName, true);
+      }
+    }, 1800);
+  }
+
+  // Host ticker for countdowns, shot clocks & AI bots
+  const hostTick = setInterval(() => {
+    if (role !== 'host' || !hostRoom) return;
+    const rm = hostRoom;
     const now = Date.now();
+
     if (rm.phase === 'huddle' && rm.huddleEndsAt > 0 && now >= rm.huddleEndsAt) {
       dealCardsOnRoom(rm, 2200);
-      saveAndBroadcast(rm);
+      broadcastFromHost();
     } else if (rm.phase === 'countdown' && now >= rm.countdownEndsAt) {
       rm.phase = 'playing';
       rm.countdownEndsAt = 0;
       rm.lastFlushAt = now;
       rm.lastAction = { timestamp: now, event: { kind: 'round_live' } };
-      saveAndBroadcast(rm);
+      broadcastFromHost();
     } else if (rm.phase === 'accusing' && rm.accusation && now >= rm.accusation.expiresAt) {
       const opps = getActivePlayers(rm).filter((p) => p.teamIndex !== rm.accusation.callerTeam);
       if (opps.length > 0) {
         executeNotKemp(rm, rm.accusation.callerId, opps[randInt(opps.length)].id);
-        saveAndBroadcast(rm);
+        broadcastFromHost();
       }
     } else if (rm.phase === 'playing') {
       if (getActivePlayers(rm).some((p) => p.isBot) && Math.random() < 0.5) {
         const before = JSON.stringify(rm);
         runBotsStep(rm);
-        if (JSON.stringify(rm) !== before) saveAndBroadcast(rm);
+        if (JSON.stringify(rm) !== before) broadcastFromHost();
       }
     }
-  }, 450);
+  }, 420);
 
   return {
     destroy() {
-      clearInterval(tick);
-      channel?.close();
+      clearInterval(hostTick);
+      cleanupPeers();
     },
 
     send(msg) {
       const { type } = msg || {};
 
       if (type === 'create_room') {
+        cleanupPeers();
+        role = 'host';
         const code = genCode();
-        const host = makePlayer(tabId, msg.name, false);
-        const rm = makeFreshRoom(code, host);
+        const host = makePlayer(myId, msg.name, false);
+        hostRoom = makeFreshRoom(code, host);
         if (msg.quickDemo) {
-          fillBotsOnRoom(rm);
-          startMatchOnRoom(rm, tabId);
-        } else {
-          onEvent({
-            type: 'toast',
-            kind: 'info',
-            message: 'Practice / Same-Browser Mode — add Firebase config to sync across separate phones/laptops!',
-          });
+          fillBotsOnRoom(hostRoom);
+          startMatchOnRoom(hostRoom, myId);
         }
-        activeCode = code;
-        onEvent({ type: 'joined', roomCode: code, playerId: tabId, token: tabId });
-        saveAndBroadcast(rm);
+        onEvent({ type: 'joined', roomCode: code, playerId: myId, token: myId });
+        startHostPeerBroker(true);
+        broadcastFromHost();
         return;
       }
 
       if (type === 'join_room') {
         const code = String(msg.code || '').trim().toUpperCase();
-        const rm = loadRoom(code);
-        if (!rm) {
-          onEvent({
-            type: 'error',
-            code: 'ROOM_NOT_FOUND',
-            message: `Room "${code}" not found on this browser (paste firebaseConfig to link separate devices!).`,
-          });
+        // If this tab was the host of `code` and just refreshed, restore host role!
+        const restored = loadPersistedHostRoom(code);
+        if (restored && restored.hostId === myId) {
+          cleanupPeers();
+          role = 'host';
+          hostRoom = restored;
+          if (hostRoom.players[myId]) {
+            hostRoom.players[myId].connected = true;
+            if (msg.name) hostRoom.players[myId].name = cleanName(msg.name);
+          }
+          onEvent({ type: 'joined', roomCode: code, playerId: myId, token: myId });
+          startHostPeerBroker(false);
+          broadcastFromHost();
           return;
         }
-        let p = rm.players[tabId];
-        if (p) {
-          p.connected = true;
-          if (msg.name) p.name = cleanName(msg.name);
-        } else {
-          p = makePlayer(tabId, msg.name, false);
-          rm.players[tabId] = p;
-          if (rm.phase === 'lobby') autoSeat(rm, tabId);
-        }
-        activeCode = code;
-        onEvent({ type: 'joined', roomCode: code, playerId: tabId, token: tabId });
-        saveAndBroadcast(rm);
+
+        cleanupPeers();
+        connectAsGuest(code, msg.name || 'Player', false);
         return;
       }
 
       if (type === 'leave_room') {
-        activeCode = null;
-        onEvent({ type: 'left_room' });
-        return;
-      }
-
-      if (!activeCode) return;
-      const rm = loadRoom(activeCode);
-      if (!rm) return;
-
-      let res = { ok: true };
-      switch (type) {
-        case 'select_seat': res = seatOnRoom(rm, tabId, Number(msg.teamIndex), Number(msg.seatIndex)); break;
-        case 'add_bot': res = addBotOnRoom(rm, Number(msg.teamIndex), Number(msg.seatIndex)); break;
-        case 'fill_bots': res = fillBotsOnRoom(rm); break;
-        case 'remove_player': {
-          const tgt = rm.players[msg.targetId];
-          if (tgt && tgt.id !== tabId) {
-            if (tgt.teamIndex !== null && rm.teams[tgt.teamIndex]?.seats[tgt.seatIndex] === tgt.id) {
-              rm.teams[tgt.teamIndex].seats[tgt.seatIndex] = '';
-            }
-            delete rm.players[tgt.id];
+        if (role === 'host') {
+          try { sessionStorage.removeItem('kemp_p2p_hosted_code'); } catch {}
+          cleanupPeers();
+          onEvent({ type: 'left_room' });
+        } else if (role === 'guest') {
+          if (guestConn?.open) {
+            try { guestConn.send({ type: 'leave_room' }); } catch {}
           }
-          break;
+          cleanupPeers();
+          onEvent({ type: 'left_room' });
         }
-        case 'update_settings': res = updateSettingsOnRoom(rm, tabId, msg.settings || {}); break;
-        case 'start_match': res = startMatchOnRoom(rm, tabId); break;
-        case 'huddle_message': res = addHuddleMsg(rm, tabId, msg.text); break;
-        case 'huddle_signal': res = setSignalOnRoom(rm, tabId, msg.signalNote); break;
-        case 'huddle_ready': res = toggleReadyOnRoom(rm, tabId); break;
-        case 'swap_card': res = swapCardOnRoom(rm, tabId, msg.handCardId, Number(msg.centerIndex), msg.expectedCenterCardId); break;
-        case 'toggle_flush': res = toggleFlushOnRoom(rm, tabId); break;
-        case 'table_tell': res = sendTellOnRoom(rm, tabId, msg.tellKey); break;
-        case 'call_kemp': res = executeKemp(rm, tabId); break;
-        case 'call_not_kemp': res = executeNotKemp(rm, tabId, msg.targetPlayerId || null); break;
-        case 'next_round': enterHuddleOnRoom(rm); break;
-        case 'return_lobby':
-          rm.phase = 'lobby';
-          rm.roundNumber = 0;
-          rm.centerCards = [];
-          rm.roundSummary = null;
-          rm.matchWinnerTeam = null;
-          rm.teams.forEach((t) => { t.letters = 0; t.eliminated = false; });
-          Object.values(rm.players).forEach((p) => { p.hand = []; p.huddleReady = false; });
-          break;
-      }
-
-      if (res && res.ok === false) {
-        if (res.code === 'RACE_LOST') onEvent({ type: 'swap_rejected', code: res.code, message: res.message });
-        else if (res.message) onEvent({ type: 'toast', kind: 'warn', message: res.message });
         return;
       }
-      saveAndBroadcast(rm);
+
+      if (role === 'host' && hostRoom) {
+        const res = applyRoomActionAsHost(myId, msg);
+        if (res && res.ok === false) {
+          if (res.code === 'RACE_LOST') {
+            onEvent({ type: 'swap_rejected', code: res.code, message: res.message });
+          } else if (res.message) {
+            onEvent({ type: 'toast', kind: 'warn', message: res.message });
+          }
+          return;
+        }
+        broadcastFromHost();
+      } else if (role === 'guest') {
+        if (guestConn && guestConn.open) {
+          guestConn.send(msg);
+        } else {
+          onEvent({ type: 'toast', kind: 'warn', message: 'Reconnecting to room host…' });
+        }
+      }
     },
   };
 }
