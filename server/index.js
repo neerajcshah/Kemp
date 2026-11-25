@@ -25,6 +25,7 @@ import {
   sendHuddleMessage,
   serializeRoomForPlayer,
   setTeamSignalNote,
+  setTeamTellKey,
   startMatch,
   startRoundHuddle,
   swapCard,
@@ -366,6 +367,13 @@ export function createKempServer() {
         break;
       }
 
+      case 'huddle_tell_key': {
+        const res = setTeamTellKey(room, playerId, msg.tellKey);
+        if (!res.ok) return sendJson(ws, { type: 'toast', kind: 'warn', message: res.message });
+        broadcastRoom(room);
+        break;
+      }
+
       case 'huddle_ready': {
         const res = toggleHuddleReady(room, playerId);
         if (!res.ok) return sendJson(ws, { type: 'toast', kind: 'warn', message: res.message });
@@ -389,10 +397,15 @@ export function createKempServer() {
           });
           return;
         }
+        const swapper = room.players.get(playerId);
         broadcastRoom(room, {
           kind: 'card_swapped',
           playerId,
+          playerName: swapper?.name || 'Player',
+          teamIndex: swapper?.teamIndex ?? null,
           centerIndex: Number(msg.centerIndex),
+          pickedUp: res.pickedUp,
+          discarded: res.discarded,
         });
         break;
       }
@@ -507,16 +520,37 @@ export function createKempServer() {
 
       if (room.phase === 'playing') {
         const prevPhase = room.phase;
+        const prevActionTs = room.lastAction?.timestamp || 0;
         const botMutated = tickRoomBots(room);
         if (botMutated) {
-          const event =
-            room.phase !== prevPhase && room.roundSummary
-              ? {
-                  kind: 'showdown',
-                  callType: room.roundSummary.callType,
-                  success: room.roundSummary.success,
-                }
-              : null;
+          let event = null;
+          if (room.phase !== prevPhase && room.roundSummary) {
+            event = {
+              kind: 'showdown',
+              callType: room.roundSummary.callType,
+              success: room.roundSummary.success,
+            };
+          } else if (room.lastAction && room.lastAction.timestamp > prevActionTs) {
+            if (room.lastAction.type === 'swap') {
+              event = {
+                kind: 'card_swapped',
+                playerId: room.lastAction.playerId,
+                playerName: room.lastAction.playerName,
+                teamIndex: room.lastAction.teamIndex,
+                centerIndex: room.lastAction.centerIndex,
+                pickedUp: room.lastAction.pickedUp,
+                discarded: room.lastAction.discarded,
+              };
+            } else if (room.lastAction.type === 'tell') {
+              event = {
+                kind: 'table_tell',
+                playerId: room.lastAction.playerId,
+                tellKey: room.lastAction.tellKey,
+              };
+            } else if (room.lastAction.type === 'flush') {
+              event = { kind: 'center_flushed' };
+            }
+          }
           broadcastRoom(room, event);
         }
       }

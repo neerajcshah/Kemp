@@ -148,6 +148,7 @@ export function createRoom(code, hostPlayer) {
     huddleEndsAt: 0,
     accusation: null, // { callerId, callerName, callerTeam, expiresAt }
     lastAction: null,
+    recentSwaps: [],
     activeTells: new Map(), // playerId -> { tellKey, label, icon, expiresAt }
     roundSummary: null,
     matchWinnerTeam: null,
@@ -170,6 +171,7 @@ export function createPlayerRecord({ id, token, name, isBot = false }) {
     huddleReady: false,
     nextRoundReady: false,
     lastSwapAt: 0,
+    lastSwap: null,
   };
 }
 
@@ -456,26 +458,29 @@ export function startRoundHuddle(room) {
 
   for (const team of getActiveTeams(room)) {
     const prevHuddle = room.teamHuddles.get(team.index);
-    const botTellKey = tellKeys[crypto.randomInt(0, tellKeys.length)];
-    const tellInfo = TABLE_TELLS[botTellKey];
 
     const p0 = room.players.get(team.seats[0]);
     const p1 = room.players.get(team.seats[1]);
     const hasBot = Boolean((p0 && p0.isBot) || (p1 && p1.isBot));
     const hasHuman = Boolean((p0 && !p0.isBot) || (p1 && !p1.isBot));
 
+    const chosenTellKey = hasBot
+      ? tellKeys[crypto.randomInt(0, tellKeys.length)]
+      : prevHuddle?.teamTellKey || tellKeys[team.index % tellKeys.length];
+    const chosenInfo = TABLE_TELLS[chosenTellKey];
+
     const messages = [];
-    let signalNote = prevHuddle?.signalNote || '';
+    let signalNote = prevHuddle?.signalNote || `${chosenInfo.label} = 4-of-a-kind`;
 
     if (hasBot) {
       const botPlayer = p0?.isBot ? p0 : p1;
-      signalNote = `${tellInfo.label} = 4-of-a-kind`;
+      signalNote = `${chosenInfo.label} = 4-of-a-kind`;
       if (hasHuman && botPlayer) {
         messages.push({
           id: crypto.randomUUID(),
           senderId: botPlayer.id,
           senderName: botPlayer.name,
-          text: `Round ${room.roundNumber} plan: Watch me — I will "${tellInfo.label}" when I get 4-of-a-kind! Do that same tell if YOU get 4-of-a-kind and I'll yell KEMP!`,
+          text: `Round ${room.roundNumber} plan: Watch me — I will "${chosenInfo.label}" when I get 4-of-a-kind! Press the glowing "${chosenInfo.label}" signal button if YOU get 4-of-a-kind and I'll yell KEMP!`,
           timestamp: Date.now(),
         });
       }
@@ -484,12 +489,16 @@ export function startRoundHuddle(room) {
     room.teamHuddles.set(team.index, {
       messages,
       signalNote,
-      botTellKey,
+      teamTellKey: chosenTellKey,
+      botTellKey: chosenTellKey,
     });
   }
 
+  room.recentSwaps = [];
+
   for (const p of room.players.values()) {
     p.hand = [];
+    p.lastSwap = null;
     p.nextRoundReady = false;
     const onActiveTeam =
       p.teamIndex !== null &&
@@ -557,6 +566,28 @@ export function setTeamSignalNote(room, playerId, signalNote) {
   return { ok: true };
 }
 
+export function setTeamTellKey(room, playerId, tellKey) {
+  if (room.phase !== 'huddle') {
+    return { ok: false, message: 'Team signal is locked once cards are dealt.' };
+  }
+  const player = room.players.get(playerId);
+  if (!player || player.teamIndex === null) {
+    return { ok: false, message: 'Not on a team.' };
+  }
+  const tell = TABLE_TELLS[tellKey];
+  if (!tell) {
+    return { ok: false, message: 'Invalid signal gesture.' };
+  }
+  const huddle = room.teamHuddles.get(player.teamIndex);
+  if (!huddle) return { ok: false, message: 'Team huddle unavailable.' };
+
+  huddle.teamTellKey = tell.key;
+  huddle.botTellKey = tell.key;
+  huddle.signalNote = `${tell.label} = 4-of-a-kind`;
+  room.updatedAt = Date.now();
+  return { ok: true };
+}
+
 export function toggleHuddleReady(room, playerId) {
   if (room.phase !== 'huddle') {
     return { ok: false, message: 'Not in huddle phase.' };
@@ -598,11 +629,13 @@ export function beginCountdownAndDeal(room, countdownMs = 2200) {
   for (const player of activePlayers) {
     player.hand = sortHand(deck.splice(0, 4));
     player.lastSwapAt = 0;
+    player.lastSwap = null;
   }
 
   room.centerCards = deck.splice(0, 4);
   room.deck = deck;
   room.discardPile = [];
+  room.recentSwaps = [];
   room.flushVotes.clear();
   room.flushCount = 0;
   room.lastFlushAt = Date.now();
@@ -682,20 +715,32 @@ export function swapCard(room, playerId, handCardId, centerIndex, expectedCenter
   const discardedCard = player.hand[handIdx];
   player.hand[handIdx] = centerCard;
   room.centerCards[cIdx] = discardedCard;
-  player.lastSwapAt = Date.now();
+  const now = Date.now();
+  player.lastSwapAt = now;
+  player.lastSwap = {
+    pickedUp: centerCard,
+    discarded: discardedCard,
+    centerIndex: cIdx,
+    timestamp: now,
+  };
 
   // Reset center flush votes because a new card entered the center
   room.flushVotes.clear();
 
-  room.lastAction = {
+  const swapRecord = {
+    id: crypto.randomUUID(),
     type: 'swap',
     playerId: player.id,
     playerName: player.name,
     teamIndex: player.teamIndex,
     centerIndex: cIdx,
-    timestamp: Date.now(),
+    pickedUp: centerCard,
+    discarded: discardedCard,
+    timestamp: now,
   };
-  room.updatedAt = Date.now();
+  room.recentSwaps = [swapRecord, ...(room.recentSwaps || [])].slice(0, 5);
+  room.lastAction = swapRecord;
+  room.updatedAt = now;
 
   return { ok: true, pickedUp: centerCard, discarded: discardedCard };
 }
@@ -768,6 +813,7 @@ export function triggerTableTell(room, playerId, tellKey) {
   const tell = TABLE_TELLS[tellKey];
   if (!tell) return { ok: false, message: 'Unknown table gesture.' };
 
+  const now = Date.now();
   room.activeTells.set(playerId, {
     playerId,
     playerName: player.name,
@@ -775,10 +821,17 @@ export function triggerTableTell(room, playerId, tellKey) {
     tellKey: tell.key,
     label: tell.label,
     icon: tell.icon,
-    timestamp: Date.now(),
-    expiresAt: Date.now() + 2800,
+    timestamp: now,
+    expiresAt: now + 4500,
   });
-  room.updatedAt = Date.now();
+  room.lastAction = {
+    type: 'tell',
+    playerId,
+    playerName: player.name,
+    tellKey: tell.key,
+    timestamp: now,
+  };
+  room.updatedAt = now;
   return { ok: true };
 }
 
@@ -1182,6 +1235,7 @@ export function returnToLobby(room, actorId) {
   room.accusation = null;
   room.roundSummary = null;
   room.matchWinnerTeam = null;
+  room.recentSwaps = [];
   room.activeTells.clear();
   for (let t = 0; t < 4; t++) {
     room.teams[t].letters = 0;
@@ -1189,6 +1243,7 @@ export function returnToLobby(room, actorId) {
   }
   for (const p of room.players.values()) {
     p.hand = [];
+    p.lastSwap = null;
     p.huddleReady = false;
     p.nextRoundReady = false;
   }
@@ -1245,6 +1300,7 @@ export function serializeRoomForPlayer(room, viewerId) {
     nextRoundReady: p.nextRoundReady,
     flushVoted: room.flushVotes.has(p.id),
     lastSwapAt: p.lastSwapAt,
+    lastSwap: p.lastSwap || null,
     // Only send actual card faces to the owner or during round_over/match_over reveal!
     hand: p.id === viewerId || showAllHands ? p.hand : null,
   }));
@@ -1257,6 +1313,7 @@ export function serializeRoomForPlayer(room, viewerId) {
         // Huddle chat messages ONLY accessible during huddle phase!
         messages: room.phase === 'huddle' ? huddle.messages : [],
         signalNote: huddle.signalNote,
+        teamTellKey: huddle.teamTellKey || huddle.botTellKey || null,
         botTellKey: huddle.botTellKey,
       };
     }
@@ -1281,6 +1338,7 @@ export function serializeRoomForPlayer(room, viewerId) {
     })),
     players: playersList,
     centerCards: room.centerCards,
+    recentSwaps: room.recentSwaps || [],
     deckRemaining: room.deck.length,
     discardCount: room.discardPile.length,
     flushVoteCount: room.flushVotes.size,

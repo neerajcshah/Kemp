@@ -71,6 +71,19 @@ class SoundFX {
     this.playTone(440, 0.22, 'sawtooth', 0.14, 0.12);
   }
 
+  quadReadyChime() {
+    // Unmistakable warm golden 4-note arpeggio played ONLY locally when your own hand hits 4-of-a-kind
+    [523.25, 659.25, 783.99, 987.77].forEach((f, idx) => {
+      this.playTone(f, 0.24, 'sine', 0.16, idx * 0.075);
+    });
+  }
+
+  tellPing() {
+    // Gentle parlor wood-tap / bell cue when someone performs a table gesture
+    this.playTone(660, 0.08, 'sine', 0.09, 0);
+    this.playTone(880, 0.11, 'triangle', 0.08, 0.06);
+  }
+
   victoryChord() {
     [523.25, 659.25, 783.99, 1046.5].forEach((f, idx) => {
       this.playTone(f, 0.28, 'triangle', 0.12, idx * 0.065);

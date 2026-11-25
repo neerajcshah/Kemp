@@ -13,6 +13,7 @@ import {
   sanitizeMeetUrl,
   sendHuddleMessage,
   serializeRoomForPlayer,
+  setTeamTellKey,
   startMatch,
   swapCard,
   toggleFlushVote,
@@ -79,12 +80,16 @@ test('Secret partner huddle isolates messages per team and locks during play', (
 
   startMatch(room, host.id);
   sendHuddleMessage(room, host.id, 'Scratch nose for 4-of-a-kind');
+  const tellRes = setTeamTellKey(room, host.id, 'sip');
+  assert.equal(tellRes.ok, true);
 
   const partnerView = serializeRoomForPlayer(room, partner.id);
   const oppView = serializeRoomForPlayer(room, opp1.id);
 
   assert.equal(partnerView.myHuddle.messages.length, 1);
   assert.equal(partnerView.myHuddle.messages[0].text, 'Scratch nose for 4-of-a-kind');
+  assert.equal(partnerView.myHuddle.teamTellKey, 'sip');
+  assert.notEqual(oppView.myHuddle.teamTellKey, 'sip');
   assert.equal(oppView.myHuddle.messages.length, 0);
 
   // Ready everyone -> deals cards and hides huddle messages
@@ -98,14 +103,15 @@ test('Secret partner huddle isolates messages per team and locks during play', (
 
   const livePartnerView = serializeRoomForPlayer(room, partner.id);
   assert.equal(livePartnerView.myHuddle.messages.length, 0);
+  assert.equal(livePartnerView.myHuddle.teamTellKey, 'sip');
   // Opponent hands remain hidden during live play
   const caraEntry = livePartnerView.players.find((p) => p.id === opp1.id);
   assert.equal(caraEntry.hand, null);
   assert.equal(caraEntry.cardCount, 4);
 });
 
-test('Simultaneous card swap enforces expectedCenterCardId race protection', () => {
-  const { room, host, opp1 } = setupLive2v2Room();
+test('Simultaneous card swap enforces expectedCenterCardId race protection and tracks public Took/Left cards', () => {
+  const { room, host, partner, opp1 } = setupLive2v2Room();
 
   const targetCenter = room.centerCards[0];
   const hostDiscard = host.hand[0];
@@ -117,12 +123,22 @@ test('Simultaneous card swap enforces expectedCenterCardId race protection', () 
   assert.ok(host.hand.some((c) => c.id === targetCenter.id));
   assert.equal(room.centerCards[0].id, hostDiscard.id);
 
+  // Partner & Opponent views publicly record which face-up card Alice took and left, while keeping her hand hidden
+  const oppProjected = serializeRoomForPlayer(room, opp1.id);
+  const aliceOnOppView = oppProjected.players.find((p) => p.id === host.id);
+  assert.equal(aliceOnOppView.hand, null);
+  assert.equal(aliceOnOppView.lastSwap.pickedUp.id, targetCenter.id);
+  assert.equal(aliceOnOppView.lastSwap.discarded.id, hostDiscard.id);
+  assert.equal(oppProjected.recentSwaps.length, 1);
+  assert.equal(oppProjected.recentSwaps[0].pickedUp.id, targetCenter.id);
+
   // Cara's packet arrives 10ms later expecting the old card -> cleanly rejected!
   const staleGrab = swapCard(room, opp1.id, oppDiscard.id, 0, targetCenter.id);
   assert.equal(staleGrab.ok, false);
   assert.equal(staleGrab.code, 'RACE_LOST');
   // Cara keeps her original card
   assert.ok(opp1.hand.some((c) => c.id === oppDiscard.id));
+  assert.ok(partner);
 });
 
 test('Unanimous flush vote deals 4 new center cards and resets on swap', () => {

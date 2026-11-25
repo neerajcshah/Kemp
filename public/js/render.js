@@ -11,6 +11,17 @@ const KEMP_LETTERS = ['K', 'E', 'M', 'P'];
 const HAND_KEYS = ['1', '2', '3', '4'];
 const CENTER_KEYS = ['Q', 'W', 'E', 'R'];
 
+const RANK_PLURAL_LABELS = {
+  A: 'Aces',
+  K: 'Kings',
+  Q: 'Queens',
+  J: 'Jacks',
+};
+
+function pluralRankName(rank) {
+  return RANK_PLURAL_LABELS[rank] || `${rank}s`;
+}
+
 export function escapeHtml(val) {
   return String(val ?? '')
     .replace(/&/g, '&amp;')
@@ -18,6 +29,13 @@ export function escapeHtml(val) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+export function renderMiniCardChip(card) {
+  if (!card) return '';
+  const isRed = card.suit === 'H' || card.suit === 'D';
+  const symbol = SUIT_SYMBOLS[card.suit] || card.suit;
+  return `<span class="mini-card-chip ${isRed ? 'suit-red' : 'suit-black'}">${escapeHtml(card.rank)}${symbol}</span>`;
 }
 
 export function renderPlayingCard(card, opts = {}) {
@@ -30,12 +48,16 @@ export function renderPlayingCard(card, opts = {}) {
     opts.selected ? 'selected' : '',
     opts.swapReady ? 'swap-target-ready' : '',
     opts.quadGlow ? 'quad-glow' : '',
+    opts.extraClass || '',
   ]
     .filter(Boolean)
     .join(' ');
 
   const attrs = opts.dataAttrs || '';
   const kbd = opts.kbd ? `<span class="kbd-badge">${escapeHtml(opts.kbd)}</span>` : '';
+  const actionTag = opts.actionTag
+    ? `<span class="card-action-tag">${escapeHtml(opts.actionTag)}</span>`
+    : '';
 
   return `
     <div class="${classes}" ${attrs} role="${opts.interactive ? 'button' : 'img'}" tabindex="${opts.interactive ? '0' : '-1'}" aria-label="${escapeHtml(card.rank)} of ${escapeHtml(card.suit)}">
@@ -49,6 +71,7 @@ export function renderPlayingCard(card, opts = {}) {
         <span class="card-rank">${escapeHtml(card.rank)}</span>
         <span class="card-suit-sm">${symbol}</span>
       </div>
+      ${actionTag}
     </div>
   `;
 }
@@ -67,7 +90,7 @@ export function renderTopBar(container, state, ui) {
       ${
         inRoom
           ? `<button type="button" class="room-chip" id="copy-room-btn" title="Copy room invite link">
-               <span class="material-symbols-rounded" style="font-size:16px">content_copy</span>
+               <span class="material-symbols-rounded">content_copy</span>
                <span>ROOM ${escapeHtml(state.code)}</span>
              </button>`
           : ''
@@ -75,7 +98,7 @@ export function renderTopBar(container, state, ui) {
       ${
         ui.isMeetAddon
           ? `<span class="room-chip" style="border-color:hsla(146,58%,48%,0.4);color:hsl(146,65%,75%)">
-               <span class="material-symbols-rounded" style="font-size:15px">videocam</span>
+               <span class="material-symbols-rounded">videocam</span>
                <span>Inside Meet</span>
              </span>`
           : ''
@@ -99,8 +122,18 @@ export function renderTopBar(container, state, ui) {
              </button>`
           : ''
       }
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm ${ui.xlMode ? 'active-toggle' : ''}"
+        id="toggle-xl-btn"
+        title="Toggle Extra-Large Cards & Text for Easier Reading"
+      >
+        <span class="material-symbols-rounded">zoom_in</span>
+        <span>${ui.xlMode ? 'XL View: ON' : 'Large View'}</span>
+      </button>
       <button type="button" class="btn btn-ghost btn-sm" id="toggle-sound-btn" title="Toggle sound effects">
         <span class="material-symbols-rounded">${soundFX.muted ? 'volume_off' : 'volume_up'}</span>
+        <span>${soundFX.muted ? 'Muted' : 'Sound'}</span>
       </button>
       <button type="button" class="btn btn-ghost btn-sm" id="open-rules-btn">
         <span class="material-symbols-rounded">menu_book</span>
@@ -311,7 +344,7 @@ function renderLobbyView(state, ui) {
                     return `
                       <div class="seat-slot occupied">
                         <div class="seat-player-name">
-                          <span class="material-symbols-rounded" style="font-size:17px;color:var(--ivory-300)">
+                          <span class="material-symbols-rounded" style="color:var(--ivory-300)">
                             ${occupant.isBot ? 'smart_toy' : occupant.connected ? 'person' : 'wifi_off'}
                           </span>
                           <span>${escapeHtml(occupant.name)}</span>
@@ -321,7 +354,7 @@ function renderLobbyView(state, ui) {
                         ${
                           canRemove
                             ? `<button type="button" class="btn btn-ghost btn-sm" data-action="remove-player" data-player-id="${escapeHtml(occupant.id)}" title="Remove from seat">
-                                 <span class="material-symbols-rounded" style="font-size:17px">close</span>
+                                 <span class="material-symbols-rounded">close</span>
                                </button>`
                             : ''
                         }
@@ -330,7 +363,7 @@ function renderLobbyView(state, ui) {
                   }
                   return `
                     <div class="seat-slot">
-                      <span style="color:var(--ivory-400);font-size:0.84rem">Open Partner Seat</span>
+                      <span style="color:var(--ivory-300);font-size:0.9rem">Open Partner Seat</span>
                       <div style="display:flex;gap:6px">
                         <button type="button" class="btn btn-secondary btn-sm" data-action="select-seat" data-team="${team.index}" data-seat="${seatIdx}">
                           Sit Here
@@ -355,7 +388,7 @@ function renderLobbyView(state, ui) {
                       <span class="team-dot dot-${escapeHtml(team.accent)}"></span>
                       <span>Team ${escapeHtml(team.name)}</span>
                     </span>
-                    <span style="font-size:0.75rem;color:var(--ivory-400)">Partnership</span>
+                    <span style="font-size:0.82rem;color:var(--ivory-300)">Partnership</span>
                   </div>
                   ${seatRows}
                 </div>
@@ -376,7 +409,7 @@ function renderLobbyView(state, ui) {
                    <span class="material-symbols-rounded">play_arrow</span>
                    <span>${allFilled ? 'Start Match — Team Huddle' : `Fill All ${totalSeats} Seats to Start`}</span>
                  </button>`
-              : `<span style="color:var(--ivory-300);font-size:0.88rem">Waiting for host to start the match…</span>`
+              : `<span style="color:var(--ivory-300);font-size:0.92rem">Waiting for host to start the match…</span>`
           }
         </div>
       </div>
@@ -390,7 +423,7 @@ function renderLobbyView(state, ui) {
             </span>
             <a href="https://meet.new" target="_blank" rel="noopener noreferrer" class="btn btn-meet btn-sm" id="launch-meet-new-btn">
               <span>Start meet.new</span>
-              <span class="material-symbols-rounded" style="font-size:15px">open_in_new</span>
+              <span class="material-symbols-rounded">open_in_new</span>
             </a>
           </div>
           <div class="setting-hint" style="margin-bottom:8px">
@@ -541,7 +574,8 @@ function renderHuddleView(state, ui) {
       ? state.players.find((p) => p.teamIndex === me.teamIndex && p.id !== me.id)
       : null;
 
-  const huddle = state.myHuddle || { messages: [], signalNote: '' };
+  const huddle = state.myHuddle || { messages: [], signalNote: '', teamTellKey: null };
+  const activeTellKey = huddle.teamTellKey || huddle.botTellKey || 'tap';
   const remainingSec =
     state.huddleEndsAt > 0
       ? Math.max(0, Math.ceil((state.huddleEndsAt - (Date.now() - ui.serverClockSkew)) / 1000))
@@ -564,13 +598,13 @@ function renderHuddleView(state, ui) {
           <div class="setting-hint">
             ${
               partner
-                ? `Private channel with your partner <strong>${escapeHtml(partner.name)}</strong>. Opponents cannot see this.`
+                ? `Private setup with your partner <strong>${escapeHtml(partner.name)}</strong>. Opponents cannot see your choice!`
                 : 'Spectating while teams choose their secret signals.'
             }
           </div>
         </div>
         <div class="huddle-lock-note">
-          <span class="material-symbols-rounded" style="font-size:16px">lock_clock</span>
+          <span class="material-symbols-rounded">lock_clock</span>
           <span>${remainingSec !== null ? `Deals in ${remainingSec}s` : 'Locks once cards deal'}</span>
         </div>
       </div>
@@ -579,17 +613,48 @@ function renderHuddleView(state, ui) {
         me && myTeam && !myTeam.eliminated
           ? `
         <div class="field-group">
-          <label class="field-label" for="signal-note-input">Pinned Team Signal Reminder (Hidden Behind Hold-to-Peek During Play)</label>
+          <label class="field-label">
+            1. Pick Your Team's Secret Signal Button (Glows Gold When You Get 4-of-a-Kind!)
+          </label>
+          <div class="huddle-tell-picker">
+            ${(ui.tells || [])
+              .map((tell) => {
+                const isSelected = activeTellKey === tell.key;
+                return `
+                  <button
+                    type="button"
+                    class="huddle-tell-card ${isSelected ? 'selected-tell' : ''}"
+                    data-action="pick-team-tell"
+                    data-tell="${escapeHtml(tell.key)}"
+                  >
+                    <span class="material-symbols-rounded">${escapeHtml(tell.icon)}</span>
+                    <div>
+                      <div>${escapeHtml(tell.label)}</div>
+                      <div style="font-size:0.76rem;font-weight:600;color:${isSelected ? 'var(--brass-300)' : 'var(--ivory-400)'}">
+                        ${isSelected ? '★ Chosen 4-of-a-Kind Signal' : 'Tap to choose'}
+                      </div>
+                    </div>
+                  </button>
+                `;
+              })
+              .join('')}
+          </div>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label" for="signal-note-input">
+            2. Optional Extra Google Meet Camera / Voice Signal Note
+          </label>
           <div class="join-row">
             <input
               id="signal-note-input"
               class="input-field"
               type="text"
               maxlength="90"
-              placeholder="e.g., Touch left ear = Kemp, adjust glasses = fakeout"
+              placeholder="e.g., Touch left ear on camera = Kemp, cough = bluff"
               value="${escapeHtml(huddle.signalNote || '')}"
             />
-            <button type="button" class="btn btn-secondary btn-sm" id="save-signal-btn">Pin Signal</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="save-signal-btn">Pin Note</button>
           </div>
           <div class="chip-suggestions">
             ${(ui.signalSuggestions || [])
@@ -604,7 +669,7 @@ function renderHuddleView(state, ui) {
         <div class="huddle-chat-log" id="huddle-chat-log">
           ${
             huddle.messages.length === 0
-              ? `<div style="margin:auto;color:var(--ivory-400);font-size:0.84rem;text-align:center">
+              ? `<div style="margin:auto;color:var(--ivory-300);font-size:0.9rem;text-align:center">
                    Whisper your plan with ${partner ? escapeHtml(partner.name) : 'your partner'} here so nobody on Google Meet overhears!
                  </div>`
               : huddle.messages
@@ -645,7 +710,7 @@ function renderHuddleView(state, ui) {
           .map(
             (p) => `
           <span class="ready-pill ${p.huddleReady ? 'is-ready' : ''}">
-            <span class="material-symbols-rounded" style="font-size:15px">
+            <span class="material-symbols-rounded">
               ${p.huddleReady ? 'check_circle' : 'schedule'}
             </span>
             <span>${escapeHtml(p.name)}</span>
@@ -693,18 +758,56 @@ function renderTableArenaView(state, ui) {
     }
   }
   const hasQuad = bestCount === 4;
+  const quadPlural = bestRank ? pluralRankName(bestRank) : 'of a Kind';
 
-  let handStatusText = 'Select a card in hand, then tap a center card to swap';
+  const teamTellKey = state.myHuddle?.teamTellKey || state.myHuddle?.botTellKey || (ui.tells?.[0]?.key ?? 'tap');
+  const agreedTellObj =
+    (ui.tells || []).find((t) => t.key === teamTellKey) || {
+      key: 'tap',
+      label: 'Tapped the table',
+      icon: 'touch_app',
+    };
+
+  const partnerActiveTell = partner ? tellsByPlayer.get(partner.id) : null;
+  const partnerSentAgreedSignal = Boolean(
+    partnerActiveTell && teamTellKey && partnerActiveTell.tellKey === teamTellKey
+  );
+
+  let handStatusText = 'Collect 4 of the same number/face, then signal your partner!';
   if (hasQuad) {
-    handStatusText = `FOUR ${bestRank}s! Signal ${partner ? partner.name : 'your partner'} — they must yell KEMP!`;
+    handStatusText = `4 OF A KIND (${quadPlural.toUpperCase()})! Press your Signal Button now!`;
   } else if (bestCount === 3) {
-    handStatusText = `3× ${bestRank}s in hand — 1 card away!`;
+    handStatusText = `3× ${pluralRankName(bestRank)} in hand — just 1 more ${bestRank} needed!`;
   } else if (bestCount === 2) {
-    handStatusText = `Pair of ${bestRank}s in hand`;
+    handStatusText = `Pair of ${pluralRankName(bestRank)} in hand`;
   }
 
-  const canInteractCards = state.phase === 'playing' && me && me.teamIndex !== null && !state.teams[me.teamIndex]?.eliminated;
-  const botTellKey = partner?.isBot ? state.myHuddle?.botTellKey : null;
+  const canInteractCards =
+    state.phase === 'playing' &&
+    me &&
+    me.teamIndex !== null &&
+    !state.teams[me.teamIndex]?.eliminated;
+
+  const selectedHandCard = ui.selectedHandCardId
+    ? myHand.find((c) => c.id === ui.selectedHandCardId) || null
+    : null;
+  const selectedCenterCard =
+    ui.selectedCenterIndex !== null ? state.centerCards[ui.selectedCenterIndex] || null : null;
+
+  let swapGuideText =
+    'Drag a center card onto a card in your hand — or tap 1 center card & 1 hand card to trade';
+  let swapStepActive = false;
+  if (selectedCenterCard) {
+    const sym = SUIT_SYMBOLS[selectedCenterCard.suit] || selectedCenterCard.suit;
+    swapGuideText = `Taking ${selectedCenterCard.rank}${sym} — now tap which card in your hand to give up!`;
+    swapStepActive = true;
+  } else if (selectedHandCard) {
+    const sym = SUIT_SYMBOLS[selectedHandCard.suit] || selectedHandCard.suit;
+    swapGuideText = `Giving up ${selectedHandCard.rank}${sym} — now tap which center card you want!`;
+    swapStepActive = true;
+  }
+
+  const recentSwaps = (state.recentSwaps || []).slice(0, 3);
 
   return `
     ${renderScoreboardStrip(state)}
@@ -717,31 +820,46 @@ function renderTableArenaView(state, ui) {
             const isPartner = Boolean(partner && p.id === partner.id);
             const pTeam = state.teams.find((t) => t.index === p.teamIndex);
             const tell = tellsByPlayer.get(p.id);
-            const justSwapped = p.lastSwapAt && nowApprox - p.lastSwapAt < 750;
+            const justSwapped = p.lastSwapAt && nowApprox - p.lastSwapAt < 850;
             const backsCount = Math.max(0, p.cardCount || 0);
+            const isPartnerAgreedAlert = isPartner && tell && tell.tellKey === teamTellKey;
 
             return `
-              <div class="seat-pod ${isPartner ? 'is-partner' : ''} ${justSwapped ? 'just-swapped' : ''}">
-                <div class="seat-pod-info">
-                  <div class="seat-role-tag">
-                    <span class="team-dot dot-${escapeHtml(pTeam?.accent || 'emerald')}" style="display:inline-block;width:7px;height:7px;margin-right:4px"></span>
-                    ${isPartner ? 'Your Partner' : `Team ${escapeHtml(pTeam?.name || '')}`}
+              <div
+                class="seat-pod ${isPartner ? 'is-partner' : ''} ${justSwapped ? 'just-swapped' : ''} ${isPartnerAgreedAlert ? 'partner-signal-alert' : ''}"
+                data-seat-player-id="${escapeHtml(p.id)}"
+              >
+                <div class="seat-pod-top">
+                  <div class="seat-pod-info">
+                    <div class="seat-role-tag">
+                      <span class="team-dot dot-${escapeHtml(pTeam?.accent || 'emerald')}" style="display:inline-block;width:9px;height:9px;margin-right:5px"></span>
+                      ${isPartner ? '★ Your Partner' : `Opponent · Team ${escapeHtml(pTeam?.name || '')}`}
+                    </div>
+                    <div class="seat-pod-name">
+                      ${escapeHtml(p.name)}
+                      ${p.flushVoted ? '<span title="Voted for new 4 cards" style="color:var(--brass-300);font-size:0.86rem"> · Ready for New 4 ✓</span>' : ''}
+                    </div>
                   </div>
-                  <div class="seat-pod-name">
-                    ${escapeHtml(p.name)}
-                    ${p.flushVoted ? '<span title="Voted for new 4 cards" style="color:var(--brass-300);font-size:0.78rem"> ✓</span>' : ''}
+                  <div class="mini-backs" aria-label="${backsCount} cards in hand">
+                    ${Array.from({ length: backsCount })
+                      .map(() => '<span class="mini-back"></span>')
+                      .join('')}
                   </div>
                 </div>
-                <div class="mini-backs" aria-label="${backsCount} cards in hand">
-                  ${Array.from({ length: backsCount })
-                    .map(() => '<span class="mini-back"></span>')
-                    .join('')}
+
+                <div class="seat-swap-line">
+                  ${
+                    p.lastSwap?.pickedUp
+                      ? `<span>Took</span> ${renderMiniCardChip(p.lastSwap.pickedUp)} <span style="color:var(--ivory-400)">· Left</span> ${renderMiniCardChip(p.lastSwap.discarded)}`
+                      : `<span class="seat-swap-idle">Hasn't grabbed a center card yet</span>`
+                  }
                 </div>
+
                 ${
                   tell
                     ? `<div class="tell-bubble">
-                         <span class="material-symbols-rounded" style="font-size:14px">${escapeHtml(tell.icon)}</span>
-                         <span>${escapeHtml(tell.label)}</span>
+                         <span class="material-symbols-rounded">${escapeHtml(tell.icon)}</span>
+                         <span>${escapeHtml(tell.label)}${isPartnerAgreedAlert ? ' (YOUR TEAM SIGNAL!)' : ''}</span>
                        </div>`
                     : ''
                 }
@@ -755,7 +873,7 @@ function renderTableArenaView(state, ui) {
       <section class="center-well" aria-label="Center Swap Cards">
         <div class="center-meta-row">
           <span>
-            <strong>Round ${state.roundNumber}</strong> · ${state.deckRemaining} cards in stock
+            <strong>Center Cards (Round ${state.roundNumber})</strong> · ${state.deckRemaining} left in deck
             ${state.discardCount > 0 ? ` · ${state.discardCount} discarded` : ''}
           </span>
           <button
@@ -764,9 +882,14 @@ function renderTableArenaView(state, ui) {
             id="vote-flush-btn"
             ${canInteractCards ? '' : 'disabled'}
           >
-            <span class="material-symbols-rounded" style="font-size:16px">autorenew</span>
-            <span>${me?.flushVoted ? 'Voted New 4' : 'Deal New 4 Cards'} (${state.flushVoteCount}/${state.activePlayerCount})</span>
+            <span class="material-symbols-rounded">autorenew</span>
+            <span>${me?.flushVoted ? 'Voted for New 4' : 'Deal New 4 Cards'} (${state.flushVoteCount}/${state.activePlayerCount})</span>
           </button>
+        </div>
+
+        <div class="swap-guide-bar ${swapStepActive ? 'step-active' : ''}">
+          <span class="material-symbols-rounded">${swapStepActive ? 'swap_vert' : 'swipe'}</span>
+          <span>${escapeHtml(swapGuideText)}</span>
         </div>
 
         <div class="center-cards-row">
@@ -776,31 +899,94 @@ function renderTableArenaView(state, ui) {
                 interactive: canInteractCards,
                 selected: ui.selectedCenterIndex === idx,
                 swapReady: canInteractCards && Boolean(ui.selectedHandCardId),
+                actionTag:
+                  canInteractCards && ui.selectedHandCardId ? 'TAP OR DROP TO TAKE' : '',
                 kbd: CENTER_KEYS[idx],
                 dataAttrs: `data-card-zone="center" data-center-index="${idx}" data-card-id="${escapeHtml(card.id)}"`,
               })
             )
             .join('')}
         </div>
+
+        ${
+          recentSwaps.length > 0
+            ? `<div class="recent-swaps-strip" aria-live="polite">
+                 <span style="font-size:0.8rem;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:var(--brass-300)">
+                   Recent Grabs:
+                 </span>
+                 ${recentSwaps
+                   .map((sw, i) => {
+                     const who = sw.playerId === state.youId ? 'You' : sw.playerName;
+                     return `
+                       <span class="recent-swap-pill ${i === 0 ? 'latest-grab' : ''}">
+                         <strong>${escapeHtml(who)}</strong> took ${renderMiniCardChip(sw.pickedUp)}
+                         <span style="color:var(--ivory-400)">left</span> ${renderMiniCardChip(sw.discarded)}
+                       </span>
+                     `;
+                   })
+                   .join('')}
+               </div>`
+            : ''
+        }
       </section>
 
       <!-- Player Hand & Kemp / Not Kemp Slam Controls -->
-      <section class="player-dock" aria-label="Your Hand and Calls">
+      <section class="player-dock" id="my-player-dock" aria-label="Your Hand and Calls">
+        ${
+          hasQuad && canInteractCards
+            ? `<div class="quad-win-banner" role="status" aria-live="assertive">
+                 <div class="quad-win-copy">
+                   <div class="quad-win-icon">
+                     <span class="material-symbols-rounded">celebration</span>
+                   </div>
+                   <div>
+                     <div class="quad-win-title">
+                       YOU HAVE FOUR ${escapeHtml(quadPlural.toUpperCase())}!
+                     </div>
+                     <div class="quad-win-sub">
+                       You can't press KEMP for yourself — press this Signal Button so <strong>${partner ? escapeHtml(partner.name) : 'your partner'}</strong> calls KEMP!
+                     </div>
+                   </div>
+                 </div>
+                 <button
+                   type="button"
+                   class="quad-signal-hero-btn"
+                   data-action="send-tell"
+                   data-tell="${escapeHtml(agreedTellObj.key)}"
+                 >
+                   <span class="material-symbols-rounded">${escapeHtml(agreedTellObj.icon)}</span>
+                   <span>SIGNAL ${partner ? escapeHtml(partner.name.toUpperCase()) : 'PARTNER'}: "${escapeHtml(agreedTellObj.label)}"</span>
+                 </button>
+               </div>`
+            : ''
+        }
+
+        ${
+          !hasQuad && partnerSentAgreedSignal && canInteractCards
+            ? `<div class="partner-kemp-alert" role="status" aria-live="assertive">
+                 <span style="display:inline-flex;align-items:center;gap:8px">
+                   <span class="material-symbols-rounded" style="color:var(--brass-300)">notifications_active</span>
+                   <span><strong>${escapeHtml(partner.name)}</strong> sent your secret signal ("${escapeHtml(partnerActiveTell.label)}")! Press <strong>KEMP!</strong> now!</span>
+                 </span>
+               </div>`
+            : ''
+        }
+
         <div class="hand-header-row">
           <div class="hand-status-badge ${hasQuad ? 'quad-ready' : ''}">
-            <span class="material-symbols-rounded" style="font-size:18px">${hasQuad ? 'auto_awesome' : 'playing_cards'}</span>
-            <span>${escapeHtml(handStatusText)}</span>
+            <span class="material-symbols-rounded">${hasQuad ? 'auto_awesome' : 'playing_cards'}</span>
+            <span>Your Hand · ${escapeHtml(handStatusText)}</span>
           </div>
 
           <div style="display:flex;align-items:center;gap:8px">
             ${
               state.myHuddle?.signalNote
                 ? `<button type="button" class="signal-peek-pill" id="peek-signal-btn" title="Hold to peek at your team's secret signal">
-                     <span class="material-symbols-rounded" style="font-size:14px">visibility</span>
+                     <span class="material-symbols-rounded">visibility</span>
                      <span>${
                        ui.peekingSignal
                          ? escapeHtml(state.myHuddle.signalNote)
-                         : 'Hold to Peek Signal'
+                         : 'Hold to Peek Secret Signal'
                      }</span>
                    </button>`
                 : ''
@@ -809,13 +995,17 @@ function renderTableArenaView(state, ui) {
         </div>
 
         <div class="hand-And-calls">
-          <div class="my-hand-cards">
+          <div class="my-hand-cards" id="my-hand-cards">
             ${myHand
               .map((card, idx) =>
                 renderPlayingCard(card, {
                   interactive: canInteractCards,
                   selected: ui.selectedHandCardId === card.id,
                   swapReady: canInteractCards && ui.selectedCenterIndex !== null,
+                  actionTag:
+                    canInteractCards && ui.selectedCenterIndex !== null
+                      ? 'TAP OR DROP TO REPLACE'
+                      : '',
                   quadGlow: hasQuad,
                   kbd: HAND_KEYS[idx],
                   dataAttrs: `data-card-zone="hand" data-hand-index="${idx}" data-card-id="${escapeHtml(card.id)}"`,
@@ -827,12 +1017,12 @@ function renderTableArenaView(state, ui) {
           <div class="slam-buttons-col">
             <button
               type="button"
-              class="btn-slam btn-kemp"
+              class="btn-slam btn-kemp ${partnerSentAgreedSignal ? 'partner-signaled' : ''}"
               id="call-kemp-btn"
               ${canInteractCards ? '' : 'disabled'}
             >
               <span class="btn-slam-title">KEMP!</span>
-              <span class="btn-slam-sub">${partner ? `${escapeHtml(partner.name)} has 4` : 'Partner has 4'} [K]</span>
+              <span class="btn-slam-sub">${partner ? `${escapeHtml(partner.name)} has 4-of-a-kind` : 'Partner has 4'} [K]</span>
             </button>
 
             <button
@@ -842,33 +1032,30 @@ function renderTableArenaView(state, ui) {
               ${canInteractCards ? '' : 'disabled'}
             >
               <span class="btn-slam-title">NOT KEMP!</span>
-              <span class="btn-slam-sub">${state.settings.notKempMode === 'specific' ? 'Accuse foe [N]' : 'Stop foes [N]'}</span>
+              <span class="btn-slam-sub">${state.settings.notKempMode === 'specific' ? 'Opponent has 4 [N]' : 'Stop opponents [N]'}</span>
             </button>
           </div>
         </div>
 
         <div class="tells-toolbar">
-          <span style="font-size:0.75rem;color:var(--ivory-400)">
-            ${
-              partner?.isBot
-                ? 'Table Gestures (★ triggers your Bot Partner to call Kemp!):'
-                : 'Optional Table Gestures / Decoys (or signal live on Google Meet):'
-            }
+          <span class="tells-label">
+            Signal Buttons (★ = Your Team's 4-of-a-Kind Signal, others = Decoy Bluffs):
           </span>
           <div class="tells-buttons">
             ${(ui.tells || [])
               .map((tell) => {
-                const isBotSignal = botTellKey === tell.key;
+                const isTeamSignal = teamTellKey === tell.key;
+                const isUrgentQuadCta = isTeamSignal && hasQuad;
                 return `
                   <button
                     type="button"
-                    class="tell-chip-btn ${isBotSignal ? 'bot-agreed' : ''}"
+                    class="tell-chip-btn ${isTeamSignal ? 'team-agreed' : ''} ${isUrgentQuadCta ? 'quad-signal-cta' : ''}"
                     data-action="send-tell"
                     data-tell="${escapeHtml(tell.key)}"
                     ${canInteractCards ? '' : 'disabled'}
                   >
-                    <span class="material-symbols-rounded" style="font-size:14px">${escapeHtml(tell.icon)}</span>
-                    <span>${isBotSignal ? `★ ${escapeHtml(tell.label)}` : escapeHtml(tell.label)}</span>
+                    <span class="material-symbols-rounded">${escapeHtml(tell.icon)}</span>
+                    <span>${isTeamSignal ? `★ ${escapeHtml(tell.label)}` : escapeHtml(tell.label)}</span>
                   </button>
                 `;
               })
@@ -1075,36 +1262,90 @@ function renderShowdownOverlay(state) {
   `;
 }
 
+export function renderSelfKempConfirmModal(state, ui) {
+  const me = state?.players?.find((p) => p.id === state.youId);
+  const partner =
+    me && me.teamIndex !== null
+      ? state.players.find((p) => p.teamIndex === me.teamIndex && p.id !== me.id)
+      : null;
+  const teamTellKey =
+    state?.myHuddle?.teamTellKey || state?.myHuddle?.botTellKey || (ui.tells?.[0]?.key ?? 'tap');
+  const agreedTell =
+    (ui.tells || []).find((t) => t.key === teamTellKey) || {
+      key: 'tap',
+      label: 'Tapped the table',
+      icon: 'touch_app',
+    };
+
+  return `
+    <div class="overlay-backdrop" id="self-kemp-backdrop">
+      <div class="modal-card" style="max-width:540px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <span class="you-tag" style="font-size:0.82rem;padding:4px 10px">HOLD ON — YOU HAVE 4-OF-A-KIND!</span>
+          <button type="button" class="btn btn-ghost btn-sm" id="cancel-self-kemp-btn">
+            <span class="material-symbols-rounded">close</span>
+          </button>
+        </div>
+        <h2 class="panel-title" style="font-size:1.45rem;margin-bottom:8px">
+          Did You Mean to Signal ${partner ? escapeHtml(partner.name) : 'Your Partner'}?
+        </h2>
+        <p style="margin:0 0 18px;color:var(--ivory-200);font-size:0.98rem;line-height:1.5">
+          In Kemp, <strong>you cannot call KEMP! for your own hand</strong> — your partner
+          <strong>${partner ? escapeHtml(partner.name) : ''}</strong> has to press KEMP! after seeing your signal.
+          Calling KEMP! right now only wins if <em>their</em> hand also has 4-of-a-kind!
+        </p>
+
+        <div style="display:grid;gap:10px">
+          <button
+            type="button"
+            class="quad-signal-hero-btn"
+            id="confirm-send-signal-instead-btn"
+            data-tell="${escapeHtml(agreedTell.key)}"
+            style="width:100%"
+          >
+            <span class="material-symbols-rounded">${escapeHtml(agreedTell.icon)}</span>
+            <span>Send Secret Signal ("${escapeHtml(agreedTell.label)}") Instead</span>
+          </button>
+
+          <button type="button" class="btn btn-secondary" id="force-call-kemp-btn" style="width:100%">
+            <span>No, ${partner ? escapeHtml(partner.name) : 'My Partner'} Also Has 4 — Call KEMP! Anyway</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 export function renderRulesModal() {
   return `
     <div class="overlay-backdrop" id="rules-modal-backdrop">
-      <div class="modal-card" style="max-width:620px">
+      <div class="modal-card" style="max-width:640px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-          <h2 class="panel-title" style="font-size:1.4rem">How to Play Kemp Online</h2>
+          <h2 class="panel-title" style="font-size:1.45rem">How to Play Kemp Online</h2>
           <button type="button" class="btn btn-ghost btn-sm" id="close-rules-btn">
             <span class="material-symbols-rounded">close</span>
           </button>
         </div>
-        <div style="display:grid;gap:12px;color:var(--ivory-200);font-size:0.92rem">
+        <div style="display:grid;gap:13px;color:var(--ivory-200);font-size:0.96rem">
           <div>
             <strong style="color:var(--brass-300)">1. Pair with Google Meet:</strong>
-            Everyone joins one Google Meet call with cameras on so you can see real facial expressions, winks, and bluffs. Keep Kemp open side-by-side or on your phone.
+            Everyone joins one Google Meet call with cameras on so you can see real facial expressions, winks, and banter. Use the <strong>Large View</strong> button at the top anytime for bigger cards &amp; icons!
           </div>
           <div>
             <strong style="color:var(--brass-300)">2. Partner Secret Huddle:</strong>
-            Before each round, teammates get a private chat box to agree on a secret signal. As soon as cards are dealt, the huddle chat locks &amp; disappears so nobody can text mid-round!
+            Before each round, pick your team's <strong>Secret Signal Button</strong> (and optional camera cue) privately with your partner. Once cards are dealt, the huddle chat locks &amp; disappears!
           </div>
           <div>
-            <strong style="color:var(--brass-300)">3. Simultaneous Free-for-All Swaps:</strong>
-            Everyone gets 4 cards, and 4 cards flip face-up in the center. There are <strong>no turns</strong> — click a card in your hand (or keys <code>1–4</code>) and a center card (<code>Q W E R</code>) to swap. If nobody wants the center cards, click <strong>Deal New 4 Cards</strong> (<code>Space</code>).
+            <strong style="color:var(--brass-300)">3. Drag or Tap Center Cards (No Turns!):</strong>
+            Everyone gets 4 cards, and 4 cards flip face-up in the middle. <strong>Drag</strong> a center card onto a card in your hand (or tap 1 center card &amp; 1 hand card) to swap! Watch each player's box to see which cards they took and left behind.
           </div>
           <div>
-            <strong style="color:var(--brass-300)">4. Yelling "KEMP!" vs. "NOT KEMP!":</strong>
-            You <strong>cannot</strong> call Kemp for yourself! When you collect 4-of-a-kind, signal your partner so <em>they</em> slam <strong>KEMP!</strong> (<code>K</code>). Meanwhile, if you spot an opponent signaling, slam <strong>NOT KEMP!</strong> (<code>N</code>) before their partner calls Kemp!
+            <strong style="color:var(--brass-300)">4. Winning with Your Signal Button &amp; "KEMP!":</strong>
+            When you get 4-of-a-kind, a golden alert chimes and lights up your <strong>Signal Button</strong>! Press it so your partner sees your signal and slams <strong>KEMP!</strong> — or slam <strong>NOT KEMP!</strong> if you catch an opponent signaling first!
           </div>
           <div>
             <strong style="color:var(--brass-300)">5. Spelling K-E-M-P:</strong>
-            Each round awards a letter of <strong>K-E-M-P</strong> (either race to spell KEMP first, or elimination penalty mode — configurable by the host in the lobby).
+            Each round awards a letter of <strong>K-E-M-P</strong> (first team to spell K-E-M-P wins, or play elimination penalty mode).
           </div>
         </div>
       </div>

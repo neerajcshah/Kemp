@@ -1,17 +1,28 @@
 import { soundFX } from './audio.js';
 import { FIREBASE_CONFIG } from './firebaseConfig.js';
-import { renderRulesModal, renderStage, renderTopBar } from './render.js';
+import {
+  escapeHtml,
+  renderPlayingCard,
+  renderRulesModal,
+  renderSelfKempConfirmModal,
+  renderStage,
+  renderTopBar,
+} from './render.js';
 
 const topbarEl = document.getElementById('topbar-root');
 const stageEl = document.getElementById('stage-root');
+const fxLayerEl = document.getElementById('fx-layer');
 const modalRootEl = document.getElementById('modal-root');
 const toastRootEl = document.getElementById('toast-root');
 
 const urlParams = new URLSearchParams(window.location.search);
 const prefillRoom = (urlParams.get('room') || '').trim().toUpperCase().slice(0, 4);
 
+const SUIT_SYMBOLS = { S: '♠', H: '♥', D: '♦', C: '♣' };
+
 const ui = {
   savedName: localStorage.getItem('kemp_player_name') || '',
+  xlMode: localStorage.getItem('kemp_xl_mode') === '1',
   prefillRoomCode: prefillRoom,
   tells: [],
   signalSuggestions: [],
@@ -19,13 +30,26 @@ const ui = {
   selectedCenterIndex: null,
   peekingSignal: false,
   rulesOpen: false,
+  confirmSelfKempOpen: false,
   serverClockSkew: 0,
   isMeetAddon: false,
 };
 
+document.documentElement.classList.toggle('xl-mode', ui.xlMode);
+
 let roomState = null;
 let ws = null;
 let reconnectTimer = null;
+let hadQuadInCurrentHand = false;
+let dragState = null;
+let suppressClickUntil = 0;
+
+function myHandHasQuad(state = roomState) {
+  const me = state?.players?.find((p) => p.id === state.youId);
+  const hand = me?.hand || [];
+  if (hand.length !== 4) return false;
+  return hand.every((c) => c && c.rank === hand[0].rank);
+}
 
 function getSessionAuth() {
   try {
@@ -52,7 +76,7 @@ function showToast(message, kind = 'info') {
   toastRootEl.appendChild(item);
   setTimeout(() => {
     item.remove();
-  }, 3100);
+  }, 3400);
 }
 
 let fbTransport = null;
@@ -70,15 +94,144 @@ function sendWs(payload) {
 }
 
 function refreshUI() {
+  document.documentElement.classList.toggle('xl-mode', ui.xlMode);
   renderTopBar(topbarEl, roomState, ui);
   renderStage(stageEl, roomState, ui);
-  modalRootEl.innerHTML = ui.rulesOpen ? renderRulesModal() : '';
+
+  if (ui.confirmSelfKempOpen && roomState?.phase === 'playing') {
+    modalRootEl.innerHTML = renderSelfKempConfirmModal(roomState, ui);
+  } else if (ui.rulesOpen) {
+    modalRootEl.innerHTML = renderRulesModal();
+  } else {
+    modalRootEl.innerHTML = '';
+  }
+
+  // Re-apply active drag origin styling if UI refreshed mid-drag
+  if (dragState?.dragging) {
+    let origin = null;
+    if (dragState.sourceZone === 'center') {
+      origin = stageEl.querySelector(
+        `[data-card-zone="center"][data-center-index="${dragState.centerIndex}"]`
+      );
+    } else if (dragState.sourceZone === 'hand') {
+      origin = stageEl.querySelector(
+        `[data-card-zone="hand"][data-card-id="${CSS.escape(dragState.cardId)}"]`
+      );
+    }
+    if (origin) origin.classList.add('drag-origin');
+  }
 
   // Auto-scroll huddle chat to bottom when in huddle
   if (roomState?.phase === 'huddle') {
     const chatLog = document.getElementById('huddle-chat-log');
     if (chatLog) chatLog.scrollTop = chatLog.scrollHeight;
   }
+}
+
+function captureSwapGeometryBeforeRender(evt, nextState) {
+  if (!evt || evt.kind !== 'card_swapped' || !fxLayerEl) return null;
+  const centerEl = stageEl.querySelector(
+    `[data-card-zone="center"][data-center-index="${evt.centerIndex}"]`
+  );
+  if (!centerEl) return null;
+
+  const centerRect = centerEl.getBoundingClientRect();
+  let playerRect = null;
+  const isMe = evt.playerId === nextState?.youId;
+
+  if (isMe) {
+    const handCardEl = evt.discarded?.id
+      ? stageEl.querySelector(`[data-card-zone="hand"][data-card-id="${CSS.escape(evt.discarded.id)}"]`)
+      : null;
+    const handFallback = document.getElementById('my-hand-cards');
+    const targetEl = handCardEl || handFallback;
+    if (targetEl) playerRect = targetEl.getBoundingClientRect();
+  } else {
+    const seatEl = stageEl.querySelector(
+      `[data-seat-player-id="${CSS.escape(String(evt.playerId || ''))}"]`
+    );
+    if (seatEl) playerRect = seatEl.getBoundingClientRect();
+  }
+
+  if (!playerRect) return null;
+  return { centerRect, playerRect, isMe };
+}
+
+function spawnFlyingCard(card, tagText, fromX, fromY, toX, toY, endScale = 1) {
+  if (!fxLayerEl || !card) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'flying-swap-wrapper';
+  wrap.innerHTML = `
+    ${tagText ? `<span class="flying-swap-tag">${escapeHtml(tagText)}</span>` : ''}
+    ${renderPlayingCard(card)}
+  `;
+  wrap.style.transform = `translate3d(${Math.round(fromX)}px, ${Math.round(fromY)}px, 0) scale(1)`;
+  wrap.style.opacity = '1';
+  fxLayerEl.appendChild(wrap);
+
+  // Force layout so browser registers starting transform before animating
+  wrap.getBoundingClientRect();
+
+  requestAnimationFrame(() => {
+    wrap.style.transform = `translate3d(${Math.round(toX)}px, ${Math.round(toY)}px, 0) scale(${endScale})`;
+    wrap.style.opacity = endScale < 0.8 ? '0.92' : '1';
+  });
+
+  setTimeout(() => {
+    wrap.style.opacity = '0';
+  }, 540);
+
+  setTimeout(() => {
+    wrap.remove();
+  }, 700);
+}
+
+function animateCardSwap(evt, geom, nextState) {
+  if (!evt || !geom || !evt.pickedUp || !evt.discarded) return;
+  const { centerRect, playerRect, isMe } = geom;
+  const cardW = centerRect.width || 96;
+  const cardH = centerRect.height || 138;
+
+  const centerPos = {
+    x: centerRect.left,
+    y: centerRect.top,
+  };
+
+  const playerPos = isMe
+    ? {
+        x: playerRect.left + playerRect.width / 2 - cardW / 2,
+        y: playerRect.top + playerRect.height / 2 - cardH / 2,
+      }
+    : {
+        x: playerRect.left + playerRect.width / 2 - cardW / 2,
+        y: playerRect.top + playerRect.height / 2 - cardH / 2,
+      };
+
+  const who = isMe ? 'You' : evt.playerName || 'Player';
+  const pickedSym = SUIT_SYMBOLS[evt.pickedUp.suit] || evt.pickedUp.suit;
+  const discSym = SUIT_SYMBOLS[evt.discarded.suit] || evt.discarded.suit;
+
+  // 1. Center card flies to the player who grabbed it
+  spawnFlyingCard(
+    evt.pickedUp,
+    `${who} took ${evt.pickedUp.rank}${pickedSym}`,
+    centerPos.x,
+    centerPos.y,
+    playerPos.x,
+    playerPos.y,
+    isMe ? 0.98 : 0.58
+  );
+
+  // 2. Discarded card flies from that player into the center slot
+  spawnFlyingCard(
+    evt.discarded,
+    `Left ${evt.discarded.rank}${discSym}`,
+    playerPos.x,
+    playerPos.y,
+    centerPos.x,
+    centerPos.y,
+    1
+  );
 }
 
 function handleServerMessage(msg) {
@@ -104,10 +257,13 @@ function handleServerMessage(msg) {
     }
 
     case 'left_room': {
+      cancelCardDrag();
       saveSessionAuth(null);
       roomState = null;
+      hadQuadInCurrentHand = false;
       ui.selectedHandCardId = null;
       ui.selectedCenterIndex = null;
+      ui.confirmSelfKempOpen = false;
       const cleanUrl = new URL(window.location.href);
       cleanUrl.searchParams.delete('room');
       window.history.replaceState({}, '', cleanUrl.toString());
@@ -117,6 +273,8 @@ function handleServerMessage(msg) {
 
     case 'room_state': {
       const prevPhase = roomState?.phase;
+      const swapGeom = captureSwapGeometryBeforeRender(msg.event, msg.state);
+
       roomState = msg.state;
       if (roomState.serverNow) {
         ui.serverClockSkew = Date.now() - roomState.serverNow;
@@ -128,13 +286,33 @@ function handleServerMessage(msg) {
         ui.selectedHandCardId = null;
       }
       if (roomState.phase !== 'playing') {
+        cancelCardDrag();
+        hadQuadInCurrentHand = false;
         ui.selectedHandCardId = null;
         ui.selectedCenterIndex = null;
         ui.peekingSignal = false;
+        ui.confirmSelfKempOpen = false;
+      } else {
+        const nowQuad = myHandHasQuad(roomState);
+        if (nowQuad && !hadQuadInCurrentHand) {
+          soundFX.quadReadyChime();
+          const partner =
+            me && me.teamIndex !== null
+              ? roomState.players.find((p) => p.teamIndex === me.teamIndex && p.id !== me.id)
+              : null;
+          showToast(
+            `🎉 4-OF-A-KIND! Press your glowing Signal Button so ${partner ? partner.name : 'your partner'} calls KEMP!`
+          );
+        }
+        hadQuadInCurrentHand = nowQuad;
       }
 
       handleRoomAudioEvent(msg.event, prevPhase, roomState.phase);
       refreshUI();
+
+      if (swapGeom && msg.event?.kind === 'card_swapped') {
+        animateCardSwap(msg.event, swapGeom, roomState);
+      }
       break;
     }
 
@@ -234,7 +412,7 @@ async function initBackendTransport() {
     console.error('Firebase initialization failed:', err);
   }
 
-  // 3. Static host (e.g., GitHub Pages before FIREBASE_CONFIG is pasted): run in-browser practice & multi-tab engine
+  // 3. Static host (e.g., GitHub Pages): run zero-cost WebRTC P2P + AI Bot multiplayer engine
   const { createLocalPracticeTransport } = await import('./firebaseAdapter.js');
   fbTransport = createLocalPracticeTransport(handleServerMessage);
   autoRejoinIfStored();
@@ -254,6 +432,9 @@ function handleRoomAudioEvent(event, prevPhase, nextPhase) {
       break;
     case 'card_swapped':
       soundFX.cardSnap();
+      break;
+    case 'table_tell':
+      soundFX.tellPing();
       break;
     case 'freeze_not_kemp':
       soundFX.freezeAlarm();
@@ -297,6 +478,7 @@ function handleHandCardSelect(cardId) {
     return;
   }
   ui.selectedHandCardId = ui.selectedHandCardId === cardId ? null : cardId;
+  soundFX.cardSnap();
   refreshUI();
 }
 
@@ -307,7 +489,18 @@ function handleCenterCardSelect(centerIdx) {
     return;
   }
   ui.selectedCenterIndex = ui.selectedCenterIndex === centerIdx ? null : centerIdx;
+  soundFX.cardSnap();
   refreshUI();
+}
+
+function handleKempButtonIntent() {
+  if (!roomState || roomState.phase !== 'playing') return;
+  if (myHandHasQuad(roomState)) {
+    ui.confirmSelfKempOpen = true;
+    refreshUI();
+    return;
+  }
+  sendWs({ type: 'call_kemp' });
 }
 
 function copyRoomInvite() {
@@ -321,8 +514,179 @@ function copyRoomInvite() {
     .catch(() => showToast(`Room Code: ${roomState.code}`));
 }
 
+// ==========================================================================
+// Pointer Drag-and-Drop Between Center Cards & Hand Cards (Mouse + Touch)
+// ==========================================================================
+
+function findDropTargetCard(clientX, clientY, targetZone) {
+  const candidates = [...stageEl.querySelectorAll(`.playing-card.interactive[data-card-zone="${targetZone}"]`)];
+  if (candidates.length === 0) return null;
+
+  // Exact hit first
+  const exact = document
+    .elementFromPoint(clientX, clientY)
+    ?.closest(`.playing-card.interactive[data-card-zone="${targetZone}"]`);
+  if (exact) return exact;
+
+  // Forgiving 26px proximity snap for older players / touchscreens
+  const pad = 26;
+  let best = null;
+  let bestDist = Infinity;
+  for (const el of candidates) {
+    const r = el.getBoundingClientRect();
+    if (
+      clientX >= r.left - pad &&
+      clientX <= r.right + pad &&
+      clientY >= r.top - pad &&
+      clientY <= r.bottom + pad
+    ) {
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const d = Math.hypot(clientX - cx, clientY - cy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = el;
+      }
+    }
+  }
+  return best;
+}
+
+function clearDropHoverHighlights() {
+  stageEl.querySelectorAll('.playing-card.drop-hover').forEach((el) => {
+    el.classList.remove('drop-hover');
+  });
+}
+
+function cancelCardDrag() {
+  if (!dragState) return;
+  if (dragState.ghostEl) {
+    dragState.ghostEl.remove();
+  }
+  stageEl.querySelectorAll('.playing-card.drag-origin').forEach((el) => {
+    el.classList.remove('drag-origin');
+  });
+  clearDropHoverHighlights();
+  dragState = null;
+}
+
+document.addEventListener('pointerdown', (ev) => {
+  if (ev.target.closest('#peek-signal-btn')) {
+    ui.peekingSignal = true;
+    refreshUI();
+    return;
+  }
+
+  if (ev.button !== undefined && ev.button !== 0) return;
+  if (!roomState || roomState.phase !== 'playing') return;
+
+  const cardEl = ev.target.closest('.playing-card.interactive[data-card-zone]');
+  if (!cardEl) return;
+
+  const rect = cardEl.getBoundingClientRect();
+  dragState = {
+    pointerId: ev.pointerId,
+    sourceZone: cardEl.dataset.cardZone, // 'center' | 'hand'
+    cardId: cardEl.dataset.cardId || '',
+    centerIndex: cardEl.dataset.centerIndex !== undefined ? Number(cardEl.dataset.centerIndex) : null,
+    startX: ev.clientX,
+    startY: ev.clientY,
+    offsetX: ev.clientX - rect.left,
+    offsetY: ev.clientY - rect.top,
+    width: rect.width,
+    height: rect.height,
+    cardHtml: cardEl.outerHTML,
+    dragging: false,
+    ghostEl: null,
+  };
+});
+
+window.addEventListener('pointermove', (ev) => {
+  if (!dragState || ev.pointerId !== dragState.pointerId) return;
+
+  const dx = ev.clientX - dragState.startX;
+  const dy = ev.clientY - dragState.startY;
+
+  if (!dragState.dragging) {
+    if (Math.hypot(dx, dy) < 7) return;
+    dragState.dragging = true;
+
+    if (fxLayerEl) {
+      const temp = document.createElement('div');
+      temp.innerHTML = dragState.cardHtml.trim();
+      const ghost = temp.firstElementChild;
+      if (ghost) {
+        ghost.classList.remove('selected', 'swap-target-ready');
+        ghost.classList.add('drag-ghost-card');
+        ghost.style.width = `${dragState.width}px`;
+        ghost.style.height = `${dragState.height}px`;
+        fxLayerEl.appendChild(ghost);
+        dragState.ghostEl = ghost;
+      }
+    }
+
+    const originSelector =
+      dragState.sourceZone === 'center'
+        ? `[data-card-zone="center"][data-center-index="${dragState.centerIndex}"]`
+        : `[data-card-zone="hand"][data-card-id="${CSS.escape(dragState.cardId)}"]`;
+    stageEl.querySelector(originSelector)?.classList.add('drag-origin');
+  }
+
+  if (dragState.ghostEl) {
+    const gx = Math.round(ev.clientX - dragState.offsetX);
+    const gy = Math.round(ev.clientY - dragState.offsetY);
+    dragState.ghostEl.style.transform = `translate3d(${gx}px, ${gy}px, 0) rotate(3deg) scale(1.05)`;
+  }
+
+  clearDropHoverHighlights();
+  const oppositeZone = dragState.sourceZone === 'center' ? 'hand' : 'center';
+  const dropTarget = findDropTargetCard(ev.clientX, ev.clientY, oppositeZone);
+  if (dropTarget) {
+    dropTarget.classList.add('drop-hover');
+  }
+});
+
+function finishPointerInteraction(ev) {
+  stopPeekingSignal();
+  if (!dragState || ev.pointerId !== dragState.pointerId) return;
+
+  if (dragState.dragging) {
+    suppressClickUntil = Date.now() + 260;
+    const oppositeZone = dragState.sourceZone === 'center' ? 'hand' : 'center';
+    const dropTarget = findDropTargetCard(ev.clientX, ev.clientY, oppositeZone);
+
+    const srcZone = dragState.sourceZone;
+    const srcCardId = dragState.cardId;
+    const srcCenterIdx = dragState.centerIndex;
+    cancelCardDrag();
+
+    if (dropTarget) {
+      if (srcZone === 'center' && srcCenterIdx !== null) {
+        attemptCardSwap(dropTarget.dataset.cardId, srcCenterIdx);
+      } else if (srcZone === 'hand') {
+        attemptCardSwap(srcCardId, Number(dropTarget.dataset.centerIndex));
+      }
+    }
+    return;
+  }
+
+  dragState = null;
+}
+
+window.addEventListener('pointerup', finishPointerInteraction);
+window.addEventListener('pointercancel', () => {
+  stopPeekingSignal();
+  cancelCardDrag();
+});
+
 // Delegated Click Handling
 document.addEventListener('click', (ev) => {
+  if (Date.now() < suppressClickUntil) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    return;
+  }
+
   const target = ev.target.closest('button, a, [data-card-zone]');
   if (!target) return;
 
@@ -332,6 +696,14 @@ document.addEventListener('click', (ev) => {
   }
 
   // Top bar actions
+  if (target.id === 'toggle-xl-btn') {
+    ui.xlMode = !ui.xlMode;
+    localStorage.setItem('kemp_xl_mode', ui.xlMode ? '1' : '0');
+    soundFX.cardSnap();
+    refreshUI();
+    return;
+  }
+
   if (target.id === 'toggle-sound-btn') {
     const muted = soundFX.toggleMute();
     if (!muted) soundFX.cardSnap();
@@ -347,6 +719,29 @@ document.addEventListener('click', (ev) => {
 
   if (target.id === 'close-rules-btn') {
     ui.rulesOpen = false;
+    refreshUI();
+    return;
+  }
+
+  // Self-Kemp Misclick Protection Modal Actions
+  if (target.id === 'cancel-self-kemp-btn') {
+    ui.confirmSelfKempOpen = false;
+    refreshUI();
+    return;
+  }
+
+  if (target.id === 'confirm-send-signal-instead-btn') {
+    const tellKey = target.dataset.tell || 'tap';
+    ui.confirmSelfKempOpen = false;
+    sendWs({ type: 'table_tell', tellKey });
+    showToast('Sent secret signal to your partner!');
+    refreshUI();
+    return;
+  }
+
+  if (target.id === 'force-call-kemp-btn') {
+    ui.confirmSelfKempOpen = false;
+    sendWs({ type: 'call_kemp' });
     refreshUI();
     return;
   }
@@ -461,11 +856,17 @@ document.addEventListener('click', (ev) => {
   }
 
   // Huddle actions
+  if (action === 'pick-team-tell') {
+    soundFX.cardSnap();
+    sendWs({ type: 'huddle_tell_key', tellKey: target.dataset.tell });
+    return;
+  }
+
   if (target.id === 'save-signal-btn') {
     const sigInput = document.getElementById('signal-note-input');
     if (sigInput) {
       sendWs({ type: 'huddle_signal', signalNote: sigInput.value });
-      showToast('Pinned secret signal for your team!');
+      showToast('Pinned secret signal note for your team!');
     }
     return;
   }
@@ -509,7 +910,7 @@ document.addEventListener('click', (ev) => {
   }
 
   if (target.id === 'call-kemp-btn') {
-    sendWs({ type: 'call_kemp' });
+    handleKempButtonIntent();
     return;
   }
 
@@ -539,10 +940,13 @@ document.addEventListener('click', (ev) => {
   }
 });
 
-// Close rules modal when clicking backdrop
+// Close modals when clicking backdrop
 modalRootEl.addEventListener('click', (ev) => {
   if (ev.target.id === 'rules-modal-backdrop') {
     ui.rulesOpen = false;
+    refreshUI();
+  } else if (ev.target.id === 'self-kemp-backdrop') {
+    ui.confirmSelfKempOpen = false;
     refreshUI();
   }
 });
@@ -570,6 +974,11 @@ document.addEventListener('keydown', (ev) => {
   }
 
   if (ev.key === 'Escape') {
+    if (ui.confirmSelfKempOpen) {
+      ui.confirmSelfKempOpen = false;
+      refreshUI();
+      return;
+    }
     if (ui.rulesOpen) {
       ui.rulesOpen = false;
       refreshUI();
@@ -615,7 +1024,7 @@ document.addEventListener('keydown', (ev) => {
 
   if (lower === 'k') {
     ev.preventDefault();
-    sendWs({ type: 'call_kemp' });
+    handleKempButtonIntent();
     return;
   }
 
@@ -625,22 +1034,16 @@ document.addEventListener('keydown', (ev) => {
   }
 });
 
-// Hold-to-peek secret signal reminder
-document.addEventListener('pointerdown', (ev) => {
-  if (ev.target.closest('#peek-signal-btn')) {
-    ui.peekingSignal = true;
-    refreshUI();
-  }
-});
-
 function stopPeekingSignal() {
   if (ui.peekingSignal) {
     ui.peekingSignal = false;
     refreshUI();
   }
 }
-window.addEventListener('pointerup', stopPeekingSignal);
-window.addEventListener('blur', stopPeekingSignal);
+window.addEventListener('blur', () => {
+  stopPeekingSignal();
+  cancelCardDrag();
+});
 
 // Smooth countdown / shot-clock UI refresh
 setInterval(() => {

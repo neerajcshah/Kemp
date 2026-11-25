@@ -131,9 +131,12 @@ test('4-human multi-device WebRTC DataChannel game syncs rooms, keeps hands/hudd
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(p2Partner.getState().phase, 'huddle');
 
-    // Neeraj whispers secret signal to Maya; Cara (opponent) CANNOT see it!
+    // Neeraj picks secret Signal Button & whispers to Maya; Cara (opponent) CANNOT see it!
+    p1Host.transport.send({ type: 'huddle_tell_key', tellKey: 'chin' });
     p1Host.transport.send({ type: 'huddle_message', text: 'Wink twice for Kemp' });
     await new Promise((r) => setTimeout(r, 30));
+    assert.equal(p2Partner.getState().myHuddle.teamTellKey, 'chin');
+    assert.notEqual(p3Opp.getState().myHuddle.teamTellKey, 'chin');
     assert.equal(p2Partner.getState().myHuddle.messages.length, 1);
     assert.equal(p2Partner.getState().myHuddle.messages[0].text, 'Wink twice for Kemp');
     assert.equal(p3Opp.getState().myHuddle.messages.length, 0);

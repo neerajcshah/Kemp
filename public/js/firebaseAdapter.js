@@ -378,6 +378,8 @@ export async function createFirebaseTransport(firebaseConfig, onEvent) {
             return addHuddleMsg(rm, tabId, msg.text);
           case 'huddle_signal':
             return setSignalOnRoom(rm, tabId, msg.signalNote);
+          case 'huddle_tell_key':
+            return setTellKeyOnRoom(rm, tabId, msg.tellKey);
           case 'huddle_ready':
             return toggleReadyOnRoom(rm, tabId);
           case 'swap_card':
@@ -404,6 +406,7 @@ export async function createFirebaseTransport(firebaseConfig, onEvent) {
             rm.phase = 'lobby';
             rm.roundNumber = 0;
             rm.centerCards = [];
+            rm.recentSwaps = [];
             rm.roundSummary = null;
             rm.matchWinnerTeam = null;
             rm.teams.forEach((t) => {
@@ -412,6 +415,7 @@ export async function createFirebaseTransport(firebaseConfig, onEvent) {
             });
             Object.values(rm.players).forEach((p) => {
               p.hand = [];
+              p.lastSwap = null;
               p.huddleReady = false;
             });
             return { ok: true };
@@ -451,6 +455,7 @@ function makePlayer(id, name, isBot) {
     huddleReady: false,
     nextRoundReady: false,
     lastSwapAt: 0,
+    lastSwap: null,
   };
 }
 
@@ -482,6 +487,7 @@ function makeFreshRoom(code, host) {
     deck: [],
     discardPile: [],
     centerCards: [],
+    recentSwaps: [],
     flushVotes: {},
     flushCount: 0,
     lastFlushAt: 0,
@@ -505,6 +511,7 @@ function normalizeRoom(raw) {
     p.hand = p.hand || [];
     if (p.teamIndex === undefined) p.teamIndex = null;
     if (p.seatIndex === undefined) p.seatIndex = null;
+    if (p.lastSwap === undefined) p.lastSwap = null;
   });
   rm.teams = (rm.teams || TEAM_CONFIGS).map((t, idx) => ({
     index: idx,
@@ -518,6 +525,7 @@ function normalizeRoom(raw) {
   rm.deck = rm.deck || [];
   rm.discardPile = rm.discardPile || [];
   rm.centerCards = rm.centerCards || [];
+  rm.recentSwaps = rm.recentSwaps || [];
   rm.flushVotes = rm.flushVotes || {};
   rm.activeTells = rm.activeTells || {};
   if (rm.matchWinnerTeam === undefined) rm.matchWinnerTeam = null;
@@ -646,6 +654,7 @@ function enterHuddleOnRoom(rm) {
   rm.roundNumber += 1;
   rm.phase = 'huddle';
   rm.centerCards = [];
+  rm.recentSwaps = [];
   rm.flushVotes = {};
   rm.activeTells = {};
   rm.accusation = null;
@@ -655,15 +664,18 @@ function enterHuddleOnRoom(rm) {
   const tellKeys = Object.keys(TABLE_TELLS);
   for (const t of getActiveTeams(rm)) {
     const prev = rm.teamHuddles[t.index];
-    const botKey = tellKeys[randInt(tellKeys.length)];
-    const tellInfo = TABLE_TELLS[botKey];
     const p0 = rm.players[t.seats[0]];
     const p1 = rm.players[t.seats[1]];
     const botP = p0?.isBot ? p0 : p1?.isBot ? p1 : null;
     const hasHuman = Boolean((p0 && !p0.isBot) || (p1 && !p1.isBot));
 
+    const chosenKey = botP
+      ? tellKeys[randInt(tellKeys.length)]
+      : prev?.teamTellKey || tellKeys[t.index % tellKeys.length];
+    const tellInfo = TABLE_TELLS[chosenKey];
+
     const messages = [];
-    let signalNote = prev?.signalNote || '';
+    let signalNote = prev?.signalNote || `${tellInfo.label} = 4-of-a-kind`;
     if (botP) {
       signalNote = `${tellInfo.label} = 4-of-a-kind`;
       if (hasHuman) {
@@ -671,16 +683,22 @@ function enterHuddleOnRoom(rm) {
           id: `m_${Date.now()}`,
           senderId: botP.id,
           senderName: botP.name,
-          text: `Round ${rm.roundNumber} plan: Watch me — I will "${tellInfo.label}" when I get 4-of-a-kind! Click ★ "${tellInfo.label}" if YOU get 4-of-a-kind and I'll yell KEMP!`,
+          text: `Round ${rm.roundNumber} plan: Watch me — I will "${tellInfo.label}" when I get 4-of-a-kind! Press the glowing "${tellInfo.label}" signal button if YOU get 4-of-a-kind and I'll yell KEMP!`,
           timestamp: Date.now(),
         });
       }
     }
-    rm.teamHuddles[t.index] = { messages, signalNote, botTellKey: botKey };
+    rm.teamHuddles[t.index] = {
+      messages,
+      signalNote,
+      teamTellKey: chosenKey,
+      botTellKey: chosenKey,
+    };
   }
 
   Object.values(rm.players).forEach((p) => {
     p.hand = [];
+    p.lastSwap = null;
     p.nextRoundReady = false;
     const active = p.teamIndex !== null && p.teamIndex < rm.settings.numTeams && !rm.teams[p.teamIndex]?.eliminated;
     p.huddleReady = Boolean(active && p.isBot);
@@ -722,6 +740,19 @@ function setSignalOnRoom(rm, pid, note) {
   return { ok: true };
 }
 
+function setTellKeyOnRoom(rm, pid, tellKey) {
+  if (rm.phase !== 'huddle') return { ok: false, message: 'Team signal is locked during round.' };
+  const p = rm.players[pid];
+  const tell = TABLE_TELLS[tellKey];
+  if (!p || p.teamIndex === null || !tell) return { ok: false, message: 'Invalid signal gesture.' };
+  const hud = rm.teamHuddles[p.teamIndex] || { messages: [], signalNote: '' };
+  hud.teamTellKey = tell.key;
+  hud.botTellKey = tell.key;
+  hud.signalNote = `${tell.label} = 4-of-a-kind`;
+  rm.teamHuddles[p.teamIndex] = hud;
+  return { ok: true };
+}
+
 function toggleReadyOnRoom(rm, pid) {
   if (rm.phase !== 'huddle') return { ok: false };
   const p = rm.players[pid];
@@ -743,10 +774,12 @@ function dealCardsOnRoom(rm, countdownMs = 2200) {
   act.forEach((p) => {
     p.hand = sortHand(deck.splice(0, 4));
     p.lastSwapAt = 0;
+    p.lastSwap = null;
   });
   rm.centerCards = deck.splice(0, 4);
   rm.deck = deck;
   rm.discardPile = [];
+  rm.recentSwaps = [];
   rm.flushVotes = {};
   rm.flushCount = 0;
   rm.lastFlushAt = Date.now();
@@ -772,13 +805,41 @@ function swapCardOnRoom(rm, pid, handCardId, cIdx, expectedCenterId) {
   const discarded = p.hand[hIdx];
   p.hand[hIdx] = cCard;
   rm.centerCards[cIdx] = discarded;
-  p.lastSwapAt = Date.now();
-  rm.flushVotes = {};
-  rm.lastAction = {
-    timestamp: Date.now(),
-    event: { kind: 'card_swapped', playerId: pid, centerIndex: cIdx },
+  const now = Date.now();
+  p.lastSwapAt = now;
+  p.lastSwap = {
+    pickedUp: cCard,
+    discarded,
+    centerIndex: cIdx,
+    timestamp: now,
   };
-  return { ok: true };
+  rm.flushVotes = {};
+
+  const swapEntry = {
+    id: `sw_${now}_${randInt(9999)}`,
+    type: 'swap',
+    playerId: pid,
+    playerName: p.name,
+    teamIndex: p.teamIndex,
+    centerIndex: cIdx,
+    pickedUp: cCard,
+    discarded,
+    timestamp: now,
+  };
+  rm.recentSwaps = [swapEntry, ...(rm.recentSwaps || [])].slice(0, 5);
+  rm.lastAction = {
+    timestamp: now,
+    event: {
+      kind: 'card_swapped',
+      playerId: pid,
+      playerName: p.name,
+      teamIndex: p.teamIndex,
+      centerIndex: cIdx,
+      pickedUp: cCard,
+      discarded,
+    },
+  };
+  return { ok: true, pickedUp: cCard, discarded };
 }
 
 function toggleFlushOnRoom(rm, pid) {
@@ -810,6 +871,7 @@ function sendTellOnRoom(rm, pid, tellKey) {
   const p = rm.players[pid];
   const tell = TABLE_TELLS[tellKey];
   if (!p || !tell) return { ok: false };
+  const now = Date.now();
   rm.activeTells[pid] = {
     playerId: pid,
     playerName: p.name,
@@ -817,8 +879,12 @@ function sendTellOnRoom(rm, pid, tellKey) {
     tellKey: tell.key,
     label: tell.label,
     icon: tell.icon,
-    timestamp: Date.now(),
-    expiresAt: Date.now() + 2800,
+    timestamp: now,
+    expiresAt: now + 4500,
+  };
+  rm.lastAction = {
+    timestamp: now,
+    event: { kind: 'table_tell', playerId: pid, tellKey: tell.key },
   };
   return { ok: true };
 }
@@ -1109,6 +1175,7 @@ function projectRoomForViewer(rm, viewerId) {
     nextRoundReady: Boolean(p.nextRoundReady),
     flushVoted: Boolean(rm.flushVotes?.[p.id]),
     lastSwapAt: p.lastSwapAt || 0,
+    lastSwap: p.lastSwap || null,
     hand: p.id === viewerId || showAll ? p.hand || [] : null,
   }));
 
@@ -1118,6 +1185,7 @@ function projectRoomForViewer(rm, viewerId) {
     myHuddle = {
       messages: rm.phase === 'huddle' ? h.messages || [] : [],
       signalNote: h.signalNote || '',
+      teamTellKey: h.teamTellKey || h.botTellKey || null,
       botTellKey: h.botTellKey || null,
     };
   }
@@ -1141,6 +1209,7 @@ function projectRoomForViewer(rm, viewerId) {
     })),
     players: playersList,
     centerCards: rm.centerCards || [],
+    recentSwaps: rm.recentSwaps || [],
     deckRemaining: (rm.deck || []).length,
     discardCount: (rm.discardPile || []).length,
     flushVoteCount: Object.keys(rm.flushVotes || {}).length,
@@ -1316,6 +1385,8 @@ export function createLocalPracticeTransport(onEvent) {
         return addHuddleMsg(rm, actorId, msg.text);
       case 'huddle_signal':
         return setSignalOnRoom(rm, actorId, msg.signalNote);
+      case 'huddle_tell_key':
+        return setTellKeyOnRoom(rm, actorId, msg.tellKey);
       case 'huddle_ready':
         return toggleReadyOnRoom(rm, actorId);
       case 'swap_card':
@@ -1342,6 +1413,7 @@ export function createLocalPracticeTransport(onEvent) {
         rm.phase = 'lobby';
         rm.roundNumber = 0;
         rm.centerCards = [];
+        rm.recentSwaps = [];
         rm.roundSummary = null;
         rm.matchWinnerTeam = null;
         rm.teams.forEach((t) => {
@@ -1350,6 +1422,7 @@ export function createLocalPracticeTransport(onEvent) {
         });
         Object.values(rm.players).forEach((p) => {
           p.hand = [];
+          p.lastSwap = null;
           p.huddleReady = false;
         });
         return { ok: true };
