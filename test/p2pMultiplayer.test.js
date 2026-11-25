@@ -159,3 +159,115 @@ test('4-human multi-device WebRTC DataChannel game syncs rooms, keeps hands/hudd
     p4Opp.transport.destroy();
   }
 });
+
+test('Guest refresh/reconnect does not drop center-card broadcasts when old DataConnection closes late', async () => {
+  globalThis.window = { Peer: MockPeer };
+
+  const makeClientWithStorage = (storage) => {
+    globalThis.sessionStorage = storage;
+    let latestState = null;
+    let joinedCode = null;
+    let lastRejection = null;
+
+    const transport = createLocalPracticeTransport((msg) => {
+      if (msg.type === 'joined') joinedCode = msg.roomCode;
+      if (msg.type === 'room_state') latestState = msg.state;
+      if (msg.type === 'swap_rejected') lastRejection = msg;
+    });
+
+    return {
+      transport,
+      storage,
+      getState: () => latestState,
+      getCode: () => joinedCode,
+      getRejection: () => lastRejection,
+    };
+  };
+
+  const p1Host = makeClientWithStorage(makeFakeSessionStorage());
+  const p2Storage = makeFakeSessionStorage();
+  const p2OldTab = makeClientWithStorage(p2Storage);
+  const p3Opp = makeClientWithStorage(makeFakeSessionStorage());
+  const p4Opp = makeClientWithStorage(makeFakeSessionStorage());
+  let p2RefreshedTab = null;
+
+  try {
+    p1Host.transport.send({ type: 'create_room', name: 'Host' });
+    await new Promise((r) => setTimeout(r, 25));
+    const code = p1Host.getCode();
+
+    p2OldTab.transport.send({ type: 'join_room', code, name: 'Grandma' });
+    p3Opp.transport.send({ type: 'join_room', code, name: 'Uncle' });
+    p4Opp.transport.send({ type: 'join_room', code, name: 'Aunt' });
+    await new Promise((r) => setTimeout(r, 40));
+
+    // Start match and ready everyone
+    p1Host.transport.send({ type: 'start_match' });
+    await new Promise((r) => setTimeout(r, 25));
+    for (const c of [p1Host, p2OldTab, p3Opp, p4Opp]) {
+      c.transport.send({ type: 'huddle_ready' });
+    }
+
+    // Grandma refreshes her tab: new tab connects BEFORE old WebRTC connection finishes timing out!
+    p2RefreshedTab = makeClientWithStorage(p2Storage);
+    p2RefreshedTab.transport.send({ type: 'join_room', code, name: 'Grandma' });
+    await new Promise((r) => setTimeout(r, 35));
+
+    // Old tab's connection finally closes late (previously this deleted Grandma's new conn from guestConns!)
+    p2OldTab.transport.destroy();
+    await new Promise((r) => setTimeout(r, 2400)); // Finish countdown -> phase === 'playing'
+
+    assert.equal(p1Host.getState().phase, 'playing');
+    assert.equal(p2RefreshedTab.getState().phase, 'playing');
+
+    // Host swaps center slot 0 -> ALL guests (including refreshed Grandma!) must receive updated centerCards!
+    const hostHandCard = p1Host.getState().players.find((p) => p.id === p1Host.getState().youId).hand[0];
+    const initialCenter0 = p1Host.getState().centerCards[0];
+    p1Host.transport.send({
+      type: 'swap_card',
+      handCardId: hostHandCard.id,
+      centerIndex: 0,
+      expectedCenterCardId: initialCenter0.id,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(p1Host.getState().centerCards[0].id, hostHandCard.id);
+    assert.equal(p2RefreshedTab.getState().centerCards[0].id, hostHandCard.id);
+    assert.equal(p3Opp.getState().centerCards[0].id, hostHandCard.id);
+    assert.equal(p4Opp.getState().centerCards[0].id, hostHandCard.id);
+
+    // Now Uncle swaps center slot 1 -> Host, Grandma, and Aunt all see Uncle's discarded card in slot 1!
+    const uncleHandCard = p3Opp.getState().players.find((p) => p.id === p3Opp.getState().youId).hand[0];
+    const center1Before = p3Opp.getState().centerCards[1];
+    p3Opp.transport.send({
+      type: 'swap_card',
+      handCardId: uncleHandCard.id,
+      centerIndex: 1,
+      expectedCenterCardId: center1Before.id,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(p1Host.getState().centerCards[1].id, uncleHandCard.id);
+    assert.equal(p2RefreshedTab.getState().centerCards[1].id, uncleHandCard.id);
+    assert.equal(p4Opp.getState().centerCards[1].id, uncleHandCard.id);
+
+    // Simulate photo-finish race loss by Aunt expecting old center1Before -> gets swap_rejected AND fresh state!
+    const auntHandCard = p4Opp.getState().players.find((p) => p.id === p4Opp.getState().youId).hand[0];
+    p4Opp.transport.send({
+      type: 'swap_card',
+      handCardId: auntHandCard.id,
+      centerIndex: 1,
+      expectedCenterCardId: center1Before.id,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(p4Opp.getRejection()?.code, 'RACE_LOST');
+    assert.equal(p4Opp.getState().centerCards[1].id, uncleHandCard.id);
+  } finally {
+    p1Host.transport.destroy();
+    p2OldTab.transport.destroy();
+    if (p2RefreshedTab) p2RefreshedTab.transport.destroy();
+    p3Opp.transport.destroy();
+    p4Opp.transport.destroy();
+  }
+});

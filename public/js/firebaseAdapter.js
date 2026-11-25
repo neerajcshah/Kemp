@@ -428,6 +428,13 @@ export async function createFirebaseTransport(firebaseConfig, onEvent) {
       if (res && res.ok === false) {
         if (res.code === 'RACE_LOST') {
           onEvent({ type: 'swap_rejected', code: res.code, message: res.message });
+          if (latestRawRoom) {
+            onEvent({
+              type: 'room_state',
+              state: projectRoomForViewer(latestRawRoom, tabId),
+              event: null,
+            });
+          }
         } else if (res.message) {
           onEvent({ type: 'toast', kind: 'warn', message: res.message });
         }
@@ -464,6 +471,8 @@ function makeFreshRoom(code, host) {
     code,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    stateSeq: 1,
+    actionSeq: 0,
     hostId: host.id,
     phase: 'lobby',
     roundNumber: 0,
@@ -506,6 +515,8 @@ function makeFreshRoom(code, host) {
 function normalizeRoom(raw) {
   // Firebase strips empty arrays/objects on storage; restore defaults safely
   const rm = { ...raw };
+  rm.stateSeq = Number(rm.stateSeq || 1);
+  rm.actionSeq = Number(rm.actionSeq || 0);
   rm.players = rm.players || {};
   Object.values(rm.players).forEach((p) => {
     p.hand = p.hand || [];
@@ -1157,6 +1168,10 @@ function chooseBotSwap(hand, center) {
   return best;
 }
 
+function cloneCard(c) {
+  return c ? { id: c.id, rank: c.rank, suit: c.suit } : null;
+}
+
 function projectRoomForViewer(rm, viewerId) {
   const now = Date.now();
   const viewer = rm.players[viewerId] || null;
@@ -1175,8 +1190,15 @@ function projectRoomForViewer(rm, viewerId) {
     nextRoundReady: Boolean(p.nextRoundReady),
     flushVoted: Boolean(rm.flushVotes?.[p.id]),
     lastSwapAt: p.lastSwapAt || 0,
-    lastSwap: p.lastSwap || null,
-    hand: p.id === viewerId || showAll ? p.hand || [] : null,
+    lastSwap: p.lastSwap
+      ? {
+          pickedUp: cloneCard(p.lastSwap.pickedUp),
+          discarded: cloneCard(p.lastSwap.discarded),
+          centerIndex: p.lastSwap.centerIndex,
+          timestamp: p.lastSwap.timestamp,
+        }
+      : null,
+    hand: p.id === viewerId || showAll ? (p.hand || []).map(cloneCard) : null,
   }));
 
   let myHuddle = null;
@@ -1192,6 +1214,7 @@ function projectRoomForViewer(rm, viewerId) {
 
   return {
     code: rm.code,
+    stateSeq: rm.stateSeq || 1,
     serverNow: now,
     hostId: rm.hostId,
     youId: viewerId,
@@ -1208,8 +1231,12 @@ function projectRoomForViewer(rm, viewerId) {
       seats: t.seats.map((s) => s || null),
     })),
     players: playersList,
-    centerCards: rm.centerCards || [],
-    recentSwaps: rm.recentSwaps || [],
+    centerCards: (rm.centerCards || []).map(cloneCard),
+    recentSwaps: (rm.recentSwaps || []).map((sw) => ({
+      ...sw,
+      pickedUp: cloneCard(sw.pickedUp),
+      discarded: cloneCard(sw.discarded),
+    })),
     deckRemaining: (rm.deck || []).length,
     discardCount: (rm.discardPile || []).length,
     flushVoteCount: Object.keys(rm.flushVotes || {}).length,
@@ -1242,18 +1269,31 @@ export function createLocalPracticeTransport(onEvent) {
     },
   };
 
-  let myId = sessionStorage.getItem('kemp_p2p_player_id');
+  // Resolve a per-tab player ID that survives F5/pull-to-refresh (via window.name + sessionStorage)
+  // while NEVER colliding if a user clicks "Duplicate Tab" in Chrome/Safari!
+  const isRealBrowserWindow = typeof window !== 'undefined' && typeof window.addEventListener === 'function';
+  let myId = '';
+  if (isRealBrowserWindow && typeof window.name === 'string' && window.name.startsWith('kemp_p2p_id:')) {
+    myId = window.name.slice('kemp_p2p_id:'.length).trim();
+  }
+  if (!myId) {
+    myId = sessionStorage.getItem('kemp_p2p_player_id') || '';
+  }
   if (!myId) {
     myId = `p_${Math.random().toString(36).slice(2, 11)}`;
-    sessionStorage.setItem('kemp_p2p_player_id', myId);
   }
+  try {
+    sessionStorage.setItem('kemp_p2p_player_id', myId);
+    if (isRealBrowserWindow) window.name = `kemp_p2p_id:${myId}`;
+  } catch {}
 
   const roomPeerId = (code) => `kemp-online-v1-${String(code).toUpperCase()}`;
 
   let role = null; // 'host' | 'guest' | null
   let hostPeer = null;
+  let hostBrokerRetryTimer = null;
   let hostRoom = null;
-  let lastHostActionTs = 0;
+  let lastEmittedActionRef = null;
   const guestConns = new Map(); // playerId -> DataConnection
 
   let guestPeer = null;
@@ -1261,6 +1301,34 @@ export function createLocalPracticeTransport(onEvent) {
   let targetGuestCode = null;
   let targetGuestName = '';
   let guestReconnectTimer = null;
+  let guestSeenStateSeq = 0;
+  let lastHostPacketAt = 0;
+
+  // Detect duplicated browser tabs sharing the same sessionStorage playerId and mint a fresh ID for the new copy
+  let tabChannel = null;
+  const tabInstanceNonce = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  if (isRealBrowserWindow && typeof BroadcastChannel === 'function') {
+    try {
+      tabChannel = new BroadcastChannel('kemp_tab_identity_v1');
+      tabChannel.onmessage = (ev) => {
+        const d = ev.data;
+        if (!d || d.nonce === tabInstanceNonce) return;
+        if (d.type === 'probe_id' && d.playerId === myId) {
+          tabChannel.postMessage({ type: 'id_in_use', playerId: myId, nonce: tabInstanceNonce });
+        } else if (d.type === 'id_in_use' && d.playerId === myId && !role) {
+          // Another live tab already owns `myId` -> this tab was duplicated; assign a unique player ID!
+          myId = `p_${Math.random().toString(36).slice(2, 11)}`;
+          try {
+            sessionStorage.setItem('kemp_p2p_player_id', myId);
+            sessionStorage.removeItem('kemp_session');
+            sessionStorage.removeItem('kemp_p2p_hosted_code');
+            window.name = `kemp_p2p_id:${myId}`;
+          } catch {}
+        }
+      };
+      tabChannel.postMessage({ type: 'probe_id', playerId: myId, nonce: tabInstanceNonce });
+    } catch {}
+  }
 
   setTimeout(() => {
     onEvent({
@@ -1273,15 +1341,23 @@ export function createLocalPracticeTransport(onEvent) {
   function cleanupPeers() {
     role = null;
     targetGuestCode = null;
+    guestSeenStateSeq = 0;
+    lastHostPacketAt = 0;
+    if (hostBrokerRetryTimer) {
+      clearTimeout(hostBrokerRetryTimer);
+      hostBrokerRetryTimer = null;
+    }
     if (guestReconnectTimer) {
       clearTimeout(guestReconnectTimer);
       guestReconnectTimer = null;
     }
     for (const c of guestConns.values()) {
+      c._superseded = true;
       try { c.close(); } catch {}
     }
     guestConns.clear();
     if (guestConn) {
+      guestConn._superseded = true;
       try { guestConn.close(); } catch {}
       guestConn = null;
     }
@@ -1294,6 +1370,19 @@ export function createLocalPracticeTransport(onEvent) {
       guestPeer = null;
     }
     hostRoom = null;
+  }
+
+  // Release PeerJS signaling IDs cleanly when refreshing or closing tab
+  function handlePageHide() {
+    if (hostPeer) {
+      try { hostPeer.destroy(); } catch {}
+    }
+    if (guestPeer) {
+      try { guestPeer.destroy(); } catch {}
+    }
+  }
+  if (isRealBrowserWindow) {
+    window.addEventListener('pagehide', handlePageHide);
   }
 
   function persistHostRoom() {
@@ -1315,14 +1404,28 @@ export function createLocalPracticeTransport(onEvent) {
     }
   }
 
+  function sendStateToSingleGuest(pid, conn, extraEvent = null) {
+    if (!hostRoom || !conn || !conn.open) return;
+    try {
+      conn.send({
+        type: 'room_state',
+        state: projectRoomForViewer(hostRoom, pid),
+        event: extraEvent,
+      });
+    } catch (err) {
+      console.warn('Guest state send failed:', pid, err);
+    }
+  }
+
   function broadcastFromHost() {
     if (!hostRoom) return;
     hostRoom.updatedAt = Date.now();
+    hostRoom.stateSeq = (hostRoom.stateSeq || 0) + 1;
     persistHostRoom();
 
     let evt = null;
-    if (hostRoom.lastAction && hostRoom.lastAction.timestamp > lastHostActionTs) {
-      lastHostActionTs = hostRoom.lastAction.timestamp;
+    if (hostRoom.lastAction && hostRoom.lastAction !== lastEmittedActionRef) {
+      lastEmittedActionRef = hostRoom.lastAction;
       evt = hostRoom.lastAction.event || null;
     }
 
@@ -1335,15 +1438,7 @@ export function createLocalPracticeTransport(onEvent) {
 
     // 2. Project & send privately to each connected Guest over their WebRTC DataChannel
     for (const [pid, conn] of guestConns.entries()) {
-      if (conn && conn.open) {
-        try {
-          conn.send({
-            type: 'room_state',
-            state: projectRoomForViewer(hostRoom, pid),
-            event: evt,
-          });
-        } catch {}
-      }
+      sendStateToSingleGuest(pid, conn, evt);
     }
   }
 
@@ -1371,6 +1466,7 @@ export function createLocalPracticeTransport(onEvent) {
           delete rm.players[tgt.id];
           const existingConn = guestConns.get(tgt.id);
           if (existingConn) {
+            existingConn._superseded = true;
             try { existingConn.send({ type: 'left_room' }); existingConn.close(); } catch {}
             guestConns.delete(tgt.id);
           }
@@ -1432,8 +1528,12 @@ export function createLocalPracticeTransport(onEvent) {
     }
   }
 
-  function startHostPeerBroker(isFreshCreate) {
-    if (typeof window.Peer !== 'function' || !hostRoom) return;
+  function startHostPeerBroker(isFreshCreate, retryAttempt = 0) {
+    if (typeof window.Peer !== 'function' || !hostRoom || role !== 'host') return;
+    if (hostBrokerRetryTimer) {
+      clearTimeout(hostBrokerRetryTimer);
+      hostBrokerRetryTimer = null;
+    }
     if (hostPeer) {
       try { hostPeer.destroy(); } catch {}
     }
@@ -1441,14 +1541,29 @@ export function createLocalPracticeTransport(onEvent) {
     const peer = new window.Peer(roomPeerId(hostRoom.code), PEER_OPTIONS);
     hostPeer = peer;
 
+    peer.on('disconnected', () => {
+      if (hostPeer === peer && !peer.destroyed) {
+        try { peer.reconnect(); } catch {}
+      }
+    });
+
     peer.on('error', (err) => {
-      if (err?.type === 'unavailable-id' && isFreshCreate && hostRoom) {
-        // Rare 4-letter collision: roll a fresh code seamlessly
-        const nextCode = genCode();
-        hostRoom.code = nextCode;
-        onEvent({ type: 'joined', roomCode: nextCode, playerId: myId, token: myId });
-        startHostPeerBroker(true);
-        broadcastFromHost();
+      if (hostPeer !== peer) return;
+      if (err?.type === 'unavailable-id' && hostRoom) {
+        if (isFreshCreate) {
+          // Rare 4-letter collision on brand-new room: roll a fresh code seamlessly
+          const nextCode = genCode();
+          hostRoom.code = nextCode;
+          onEvent({ type: 'joined', roomCode: nextCode, playerId: myId, token: myId });
+          startHostPeerBroker(true, 0);
+          broadcastFromHost();
+        } else if (retryAttempt < 12) {
+          // Host refreshed tab and signaling server is still releasing pre-refresh socket: retry cleanly!
+          hostBrokerRetryTimer = setTimeout(() => {
+            hostBrokerRetryTimer = null;
+            startHostPeerBroker(false, retryAttempt + 1);
+          }, 1200);
+        }
       }
     });
 
@@ -1457,7 +1572,18 @@ export function createLocalPracticeTransport(onEvent) {
         if (!hostRoom || !msg || typeof msg !== 'object') return;
 
         if (msg.type === 'join_room') {
-          const guestId = String(msg.token || `g_${Math.random().toString(36).slice(2, 10)}`);
+          let guestId = String(msg.token || '').trim();
+          if (!guestId || guestId === hostRoom.hostId) {
+            guestId = `g_${Math.random().toString(36).slice(2, 10)}`;
+          }
+
+          // Cleanly supersede any previous connection for this guest so its delayed 'close' event NEVER deletes the new conn!
+          const prevConn = guestConns.get(guestId);
+          if (prevConn && prevConn !== conn) {
+            prevConn._superseded = true;
+            try { prevConn.close(); } catch {}
+          }
+
           let p = hostRoom.players[guestId];
           if (p) {
             p.connected = true;
@@ -1482,6 +1608,7 @@ export function createLocalPracticeTransport(onEvent) {
           }
 
           conn._playerId = guestId;
+          conn._superseded = false;
           guestConns.set(guestId, conn);
           try {
             conn.send({
@@ -1498,6 +1625,21 @@ export function createLocalPracticeTransport(onEvent) {
         const pid = conn._playerId;
         if (!pid || !hostRoom.players[pid]) return;
 
+        // Self-heal: ensure active DataConnection sending messages is always registered for broadcasts
+        if (!conn._superseded && guestConns.get(pid) !== conn) {
+          guestConns.set(pid, conn);
+          hostRoom.players[pid].connected = true;
+        }
+
+        if (msg.type === 'sync_check') {
+          if (Number(msg.stateSeq) !== hostRoom.stateSeq) {
+            sendStateToSingleGuest(pid, conn, null);
+          } else {
+            try { conn.send({ type: 'sync_ack', stateSeq: hostRoom.stateSeq }); } catch {}
+          }
+          return;
+        }
+
         if (msg.type === 'leave_room') {
           const pl = hostRoom.players[pid];
           if (hostRoom.phase === 'lobby') {
@@ -1508,7 +1650,10 @@ export function createLocalPracticeTransport(onEvent) {
           } else {
             pl.connected = false;
           }
-          guestConns.delete(pid);
+          if (guestConns.get(pid) === conn) {
+            guestConns.delete(pid);
+          }
+          conn._superseded = true;
           try { conn.send({ type: 'left_room' }); conn.close(); } catch {}
           broadcastFromHost();
           return;
@@ -1523,19 +1668,26 @@ export function createLocalPracticeTransport(onEvent) {
               conn.send({ type: 'toast', kind: 'warn', message: res.message });
             }
           } catch {}
+          // Always push fresh authoritative room_state immediately so Guest's middle cards are 100% up-to-date!
+          sendStateToSingleGuest(pid, conn, null);
           return;
         }
         broadcastFromHost();
       });
 
-      conn.on('close', () => {
+      const handleConnClosed = () => {
         const pid = conn._playerId;
-        if (pid && hostRoom?.players[pid]) {
+        // CRITICAL: Never delete `pid` from guestConns if a newer DataConnection already superseded `conn`!
+        if (conn._superseded || !pid || guestConns.get(pid) !== conn) return;
+        guestConns.delete(pid);
+        if (hostRoom?.players[pid]) {
           hostRoom.players[pid].connected = false;
-          guestConns.delete(pid);
           broadcastFromHost();
         }
-      });
+      };
+
+      conn.on('close', handleConnClosed);
+      conn.on('error', handleConnClosed);
     });
   }
 
@@ -1555,8 +1707,14 @@ export function createLocalPracticeTransport(onEvent) {
       onEvent({ type: 'toast', kind: 'info', message: `Connecting to Room ${code}…` });
     }
 
+    if (guestConn) {
+      guestConn._superseded = true;
+      try { guestConn.close(); } catch {}
+      guestConn = null;
+    }
     if (guestPeer) {
       try { guestPeer.destroy(); } catch {}
+      guestPeer = null;
     }
 
     const peer = new window.Peer(PEER_OPTIONS);
@@ -1564,17 +1722,27 @@ export function createLocalPracticeTransport(onEvent) {
     let settled = false;
 
     const failTimer = setTimeout(() => {
-      if (!settled && !isRetry) {
+      if (!settled && !isRetry && guestPeer === peer) {
         settled = true;
         onEvent({
           type: 'error',
           code: 'ROOM_NOT_FOUND',
           message: `Could not reach Room "${code}". Check the 4-letter code and make sure the host has the room open.`,
         });
+      } else if (!settled && isRetry && guestPeer === peer) {
+        settled = true;
+        scheduleGuestReconnect(1200);
       }
     }, 8000);
 
+    peer.on('disconnected', () => {
+      if (guestPeer === peer && !peer.destroyed) {
+        try { peer.reconnect(); } catch {}
+      }
+    });
+
     peer.on('error', (err) => {
+      if (guestPeer !== peer) return;
       if (err?.type === 'peer-unavailable' && !settled) {
         settled = true;
         clearTimeout(failTimer);
@@ -1585,18 +1753,25 @@ export function createLocalPracticeTransport(onEvent) {
             message: `Room "${code}" was not found (or the host closed their tab).`,
           });
         } else {
-          scheduleGuestReconnect();
+          scheduleGuestReconnect(1400);
         }
       }
     });
 
     peer.on('open', () => {
-      const conn = peer.connect(roomPeerId(code), { reliable: true });
+      if (guestPeer !== peer) return;
+      // Use native JSON serialization over WebRTC DataChannel (avoids BinaryPack cross-browser Blob/chunk issues)
+      const conn = peer.connect(roomPeerId(code), {
+        reliable: true,
+        serialization: 'json',
+      });
       guestConn = conn;
 
       conn.on('open', () => {
+        if (guestConn !== conn) return;
         settled = true;
         clearTimeout(failTimer);
+        lastHostPacketAt = Date.now();
         conn.send({
           type: 'join_room',
           code,
@@ -1606,34 +1781,67 @@ export function createLocalPracticeTransport(onEvent) {
       });
 
       conn.on('data', (payload) => {
-        if (payload && typeof payload === 'object') {
-          onEvent(payload);
+        if (guestConn !== conn || !payload || typeof payload !== 'object') return;
+        lastHostPacketAt = Date.now();
+        if (payload.type === 'sync_ack') {
+          return;
         }
+        if (payload.type === 'joined' && payload.token) {
+          myId = String(payload.token);
+          try {
+            sessionStorage.setItem('kemp_p2p_player_id', myId);
+            if (isRealBrowserWindow) window.name = `kemp_p2p_id:${myId}`;
+          } catch {}
+        }
+        if (payload.type === 'room_state' && payload.state?.stateSeq) {
+          guestSeenStateSeq = payload.state.stateSeq;
+        }
+        onEvent(payload);
       });
 
-      conn.on('close', () => {
+      const onGuestConnLost = () => {
+        if (conn._superseded || guestConn !== conn) return;
         if (role === 'guest' && targetGuestCode === code) {
-          scheduleGuestReconnect();
+          scheduleGuestReconnect(900);
         }
-      });
+      };
+
+      conn.on('close', onGuestConnLost);
+      conn.on('error', onGuestConnLost);
     });
   }
 
-  function scheduleGuestReconnect() {
+  function scheduleGuestReconnect(delayMs = 1400) {
     if (guestReconnectTimer || role !== 'guest' || !targetGuestCode) return;
     guestReconnectTimer = setTimeout(() => {
       guestReconnectTimer = null;
       if (role === 'guest' && targetGuestCode) {
         connectAsGuest(targetGuestCode, targetGuestName, true);
       }
-    }, 1800);
+    }, delayMs);
   }
 
-  // Host ticker for countdowns, shot clocks & AI bots
+  // Host ticker (countdowns, shot clocks, AI bots) + Guest 1s continuous state-sync & dead-link watchdog
   const hostTick = setInterval(() => {
+    const now = Date.now();
+
+    if (role === 'guest' && targetGuestCode) {
+      if (guestConn && guestConn.open) {
+        if (lastHostPacketAt > 0 && now - lastHostPacketAt > 4800) {
+          // Silent WebRTC DataChannel stall detected -> reconnect immediately
+          lastHostPacketAt = now;
+          connectAsGuest(targetGuestCode, targetGuestName, true);
+        } else {
+          try {
+            guestConn.send({ type: 'sync_check', stateSeq: guestSeenStateSeq });
+          } catch {}
+        }
+      }
+      return;
+    }
+
     if (role !== 'host' || !hostRoom) return;
     const rm = hostRoom;
-    const now = Date.now();
 
     if (rm.phase === 'huddle' && rm.huddleEndsAt > 0 && now >= rm.huddleEndsAt) {
       dealCardsOnRoom(rm, 2200);
@@ -1657,11 +1865,18 @@ export function createLocalPracticeTransport(onEvent) {
         if (JSON.stringify(rm) !== before) broadcastFromHost();
       }
     }
-  }, 420);
+  }, 500);
 
   return {
     destroy() {
       clearInterval(hostTick);
+      if (isRealBrowserWindow) {
+        window.removeEventListener('pagehide', handlePageHide);
+      }
+      if (tabChannel) {
+        try { tabChannel.close(); } catch {}
+        tabChannel = null;
+      }
       cleanupPeers();
     },
 
@@ -1679,7 +1894,7 @@ export function createLocalPracticeTransport(onEvent) {
           startMatchOnRoom(hostRoom, myId);
         }
         onEvent({ type: 'joined', roomCode: code, playerId: myId, token: myId });
-        startHostPeerBroker(true);
+        startHostPeerBroker(true, 0);
         broadcastFromHost();
         return;
       }
@@ -1697,7 +1912,7 @@ export function createLocalPracticeTransport(onEvent) {
             if (msg.name) hostRoom.players[myId].name = cleanName(msg.name);
           }
           onEvent({ type: 'joined', roomCode: code, playerId: myId, token: myId });
-          startHostPeerBroker(false);
+          startHostPeerBroker(false, 0);
           broadcastFromHost();
           return;
         }
@@ -1730,6 +1945,11 @@ export function createLocalPracticeTransport(onEvent) {
           } else if (res.message) {
             onEvent({ type: 'toast', kind: 'warn', message: res.message });
           }
+          onEvent({
+            type: 'room_state',
+            state: projectRoomForViewer(hostRoom, myId),
+            event: null,
+          });
           return;
         }
         broadcastFromHost();
@@ -1738,6 +1958,7 @@ export function createLocalPracticeTransport(onEvent) {
           guestConn.send(msg);
         } else {
           onEvent({ type: 'toast', kind: 'warn', message: 'Reconnecting to room host…' });
+          scheduleGuestReconnect(300);
         }
       }
     },

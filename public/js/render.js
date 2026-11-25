@@ -1,4 +1,4 @@
-import { soundFX } from './audio.js';
+import { soundFX } from './audio.js?v=20261125-3';
 
 const SUIT_SYMBOLS = {
   S: '♠',

@@ -1,5 +1,5 @@
-import { soundFX } from './audio.js';
-import { FIREBASE_CONFIG } from './firebaseConfig.js';
+import { soundFX } from './audio.js?v=20261125-3';
+import { FIREBASE_CONFIG } from './firebaseConfig.js?v=20261125-3';
 import {
   escapeHtml,
   renderPlayingCard,
@@ -7,7 +7,7 @@ import {
   renderSelfKempConfirmModal,
   renderStage,
   renderTopBar,
-} from './render.js';
+} from './render.js?v=20261125-3';
 
 const topbarEl = document.getElementById('topbar-root');
 const stageEl = document.getElementById('stage-root');
@@ -28,6 +28,7 @@ const ui = {
   signalSuggestions: [],
   selectedHandCardId: null,
   selectedCenterIndex: null,
+  selectedCenterCardId: null,
   peekingSignal: false,
   rulesOpen: false,
   confirmSelfKempOpen: false,
@@ -263,6 +264,7 @@ function handleServerMessage(msg) {
       hadQuadInCurrentHand = false;
       ui.selectedHandCardId = null;
       ui.selectedCenterIndex = null;
+      ui.selectedCenterCardId = null;
       ui.confirmSelfKempOpen = false;
       const cleanUrl = new URL(window.location.href);
       cleanUrl.searchParams.delete('room');
@@ -273,23 +275,45 @@ function handleServerMessage(msg) {
 
     case 'room_state': {
       const prevPhase = roomState?.phase;
-      const swapGeom = captureSwapGeometryBeforeRender(msg.event, msg.state);
+      let swapGeom = null;
+      try {
+        swapGeom = captureSwapGeometryBeforeRender(msg.event, msg.state);
+      } catch {
+        swapGeom = null;
+      }
 
       roomState = msg.state;
       if (roomState.serverNow) {
         ui.serverClockSkew = Date.now() - roomState.serverNow;
       }
 
-      // Clear stale selections if card left hand or phase changed
+      // Clear stale selections if card left hand, center card changed, or phase changed
       const me = roomState.players.find((p) => p.id === roomState.youId);
       if (!me?.hand || !me.hand.some((c) => c.id === ui.selectedHandCardId)) {
         ui.selectedHandCardId = null;
       }
+      if (
+        ui.selectedCenterIndex !== null &&
+        roomState.centerCards?.[ui.selectedCenterIndex]?.id !== ui.selectedCenterCardId
+      ) {
+        ui.selectedCenterIndex = null;
+        ui.selectedCenterCardId = null;
+      }
+      // If dragging a center card that someone else just snatched, cancel drag immediately
+      if (
+        dragState?.sourceZone === 'center' &&
+        dragState.centerIndex !== null &&
+        roomState.centerCards?.[dragState.centerIndex]?.id !== dragState.cardId
+      ) {
+        cancelCardDrag();
+      }
+
       if (roomState.phase !== 'playing') {
         cancelCardDrag();
         hadQuadInCurrentHand = false;
         ui.selectedHandCardId = null;
         ui.selectedCenterIndex = null;
+        ui.selectedCenterCardId = null;
         ui.peekingSignal = false;
         ui.confirmSelfKempOpen = false;
       } else {
@@ -311,7 +335,11 @@ function handleServerMessage(msg) {
       refreshUI();
 
       if (swapGeom && msg.event?.kind === 'card_swapped') {
-        animateCardSwap(msg.event, swapGeom, roomState);
+        try {
+          animateCardSwap(msg.event, swapGeom, roomState);
+        } catch {
+          // Ignore visual FX errors so state updates remain rock-solid
+        }
       }
       break;
     }
@@ -319,6 +347,7 @@ function handleServerMessage(msg) {
     case 'swap_rejected': {
       soundFX.raceLost();
       ui.selectedCenterIndex = null;
+      ui.selectedCenterCardId = null;
       showToast(msg.message || 'Card was snatched first!', 'warn');
       refreshUI();
       break;
@@ -403,7 +432,7 @@ async function initBackendTransport() {
       }
     }
     if (fbConfig?.apiKey) {
-      const { createFirebaseTransport } = await import('./firebaseAdapter.js');
+      const { createFirebaseTransport } = await import('./firebaseAdapter.js?v=20261125-3');
       fbTransport = await createFirebaseTransport(fbConfig, handleServerMessage);
       autoRejoinIfStored();
       return;
@@ -413,7 +442,7 @@ async function initBackendTransport() {
   }
 
   // 3. Static host (e.g., GitHub Pages): run zero-cost WebRTC P2P + AI Bot multiplayer engine
-  const { createLocalPracticeTransport } = await import('./firebaseAdapter.js');
+  const { createLocalPracticeTransport } = await import('./firebaseAdapter.js?v=20261125-3');
   fbTransport = createLocalPracticeTransport(handleServerMessage);
   autoRejoinIfStored();
 }
@@ -462,6 +491,7 @@ function attemptCardSwap(handCardId, centerIndex) {
 
   ui.selectedHandCardId = null;
   ui.selectedCenterIndex = null;
+  ui.selectedCenterCardId = null;
 
   sendWs({
     type: 'swap_card',
@@ -488,7 +518,13 @@ function handleCenterCardSelect(centerIdx) {
     attemptCardSwap(ui.selectedHandCardId, centerIdx);
     return;
   }
-  ui.selectedCenterIndex = ui.selectedCenterIndex === centerIdx ? null : centerIdx;
+  if (ui.selectedCenterIndex === centerIdx) {
+    ui.selectedCenterIndex = null;
+    ui.selectedCenterCardId = null;
+  } else {
+    ui.selectedCenterIndex = centerIdx;
+    ui.selectedCenterCardId = roomState.centerCards[centerIdx]?.id || null;
+  }
   soundFX.cardSnap();
   refreshUI();
 }

@@ -395,6 +395,11 @@ export function createKempServer() {
             code: res.code,
             message: res.message,
           });
+          sendJson(ws, {
+            type: 'room_state',
+            state: serializeRoomForPlayer(room, playerId),
+            event: null,
+          });
           return;
         }
         const swapper = room.players.get(playerId);
